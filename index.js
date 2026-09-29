@@ -4,27 +4,22 @@ const { XMLParser } = require('fast-xml-parser');
 const { X509Certificate } = require('node:crypto');
 const axios = require('axios');
 
-// ==========================================
-// 1. EXPRESS KEEP-ALIVE SERVER (FOR RENDER)
-// ==========================================
+// 1. EXPRESS KEEP-ALIVE SERVER
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.get('/', (req, res) => {
-  res.send('Keybox Checker Bot is active and running!');
+  res.send('Keybox Checker Bot is running!');
 });
 
 app.listen(PORT, () => {
-  console.log(`Keep-alive server listening on port ${PORT}`);
+  console.log(`Server started on port ${PORT}`);
 });
 
-// ==========================================
-// 2. TELEGRAM BOT CONFIG & GOOGLE CRL FETCH
-// ==========================================
+// 2. BOT CONFIGURATION
 const TOKEN = process.env.BOT_TOKEN;
-
 if (!TOKEN) {
-  console.error("FATAL ERROR: BOT_TOKEN environment variable is missing!");
+  console.error("FATAL: BOT_TOKEN is missing!");
   process.exit(1);
 }
 
@@ -39,102 +34,103 @@ async function fetchGoogleCRL() {
     });
     return response.data;
   } catch (error) {
-    console.error("Failed to fetch Google CRL:", error.message);
+    console.error("Failed to fetch CRL:", error.message);
     return null;
   }
 }
 
-// Clean and format PEM blocks to prevent OpenSSL line-ending/parsing errors
-function cleanPem(pemStr) {
-  if (!pemStr) return '';
-  // Remove carriage returns (\r), XML entity escapes, and strip whitespace
-  let clean = pemStr.replace(/\r/g, '').replace(/&#13;/g, '').trim();
-  
-  // Ensure header and footer have proper Unix newline breaks
-  clean = clean.replace(/-----BEGIN CERTIFICATE-----/g, '-----BEGIN CERTIFICATE-----\n');
-  clean = clean.replace(/-----END CERTIFICATE-----/g, '\n-----END CERTIFICATE-----');
-  
-  // Filter empty lines and join cleanly
-  const lines = clean.split('\n').map(l => l.trim()).filter(Boolean);
-  return lines.join('\n');
-}
-
-// Extract all PEM certificates from the XML
-function parseKeyboxAllCerts(xmlData) {
-  const parser = new XMLParser({ ignoreAttributes: false });
-  const jsonObj = parser.parse(xmlData);
-
-  const keybox = jsonObj.AndroidAttestation || jsonObj.Keybox;
-  if (!keybox) throw new Error("Invalid Keybox XML structure.");
-
+// Extract base64 certificates out of XML cleanly
+function extractPemsFromXml(xmlData) {
   const certs = [];
-  const extractCerts = (node) => {
-    if (typeof node === 'string' && node.includes('-----BEGIN CERTIFICATE-----')) {
-      const pemMatches = node.match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g);
-      if (pemMatches) certs.push(...pemMatches);
-    } else if (typeof node === 'object' && node !== null) {
-      for (const key in node) extractCerts(node[key]);
-    }
-  };
-
-  extractCerts(keybox);
+  // Match standard PEM certificate blocks globally
+  const matches = xmlData.match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g);
+  if (matches) {
+    matches.forEach((pem) => {
+      // Clean string completely
+      const clean = pem.replace(/\r/g, '').trim();
+      certs.push(clean);
+    });
+  }
   return certs;
 }
 
-// ==========================================
-// 3. ANALYSIS & REVOCATION CHECKING LOGIC
-// ==========================================
-async function analyzeKeybox(xmlContent) {
-  let certPems;
+// Convert ASN.1 DER serial number to Google-compatible keys
+function getSerialKeys(pem) {
+  const keys = new Set();
   try {
-    certPems = parseKeyboxAllCerts(xmlContent);
+    const cert = new X509Certificate(pem);
+    let hex = cert.serialNumber.toLowerCase().replace(/[^0-9a-f]/g, '');
+
+    // Hex variant 1: Raw
+    keys.add(hex);
+
+    // Hex variant 2: Stripped leading zeros
+    const noLeadingZeros = hex.replace(/^0+/, '');
+    if (noLeadingZeros) keys.add(noLeadingZeros);
+
+    // Hex variant 3: Ensure even length if stripped
+    if (noLeadingZeros.length % 2 !== 0) {
+      keys.add('0' + noLeadingZeros);
+    }
+
+    // Decimal variant: Base-10 string
+    try {
+      const dec = BigInt('0x' + hex).toString(10);
+      keys.add(dec);
+    } catch (e) {}
   } catch (e) {
-    return "❌ **Invalid File Format**: Could not parse Keybox XML structure.";
+    // If Node crypto fails, extract serial directly from ASN.1 Base64 Buffer
+    try {
+      const b64 = pem.replace(/-----BEGIN CERTIFICATE-----/g, '')
+                     .replace(/-----END CERTIFICATE-----/g, '')
+                     .replace(/\s+/g, '');
+      const buf = Buffer.from(b64, 'base64');
+      
+      // ASN.1 DER Serial Number offset check (TAG 0x02 after Sequence)
+      if (buf[0] === 0x30) {
+        let idx = 2;
+        if (buf[1] & 0x80) idx += (buf[1] & 0x7f); // Multi-byte length
+        if (buf[idx] === 0x02) { // Integer tag (Serial)
+          const len = buf[idx + 1];
+          const serialBuf = buf.slice(idx + 2, idx + 2 + len);
+          const rawHex = serialBuf.toString('hex').toLowerCase();
+          
+          keys.add(rawHex);
+          keys.add(rawHex.replace(/^0+/, ''));
+          try {
+            keys.add(BigInt('0x' + rawHex).toString(10));
+          } catch (err) {}
+        }
+      }
+    } catch (err) {}
   }
 
+  return Array.from(keys);
+}
+
+// Core Revocation Checking Engine
+async function analyzeKeybox(xmlContent) {
+  const certPems = extractPemsFromXml(xmlContent);
+
   if (certPems.length === 0) {
-    return "❌ **Invalid Keybox**: No certificate chains found.";
+    return "❌ **Invalid Keybox**: No certificate chains found in the provided XML.";
   }
 
   const crlData = await fetchGoogleCRL();
   if (!crlData || !crlData.entries) {
-    return "⚠️ **Error**: Unable to reach Google CRL servers. Try again in a few moments.";
+    return "⚠️ **Error**: Could not retrieve Google's Revocation List. Try again in a moment.";
   }
 
   let isRevoked = false;
 
   certPems.forEach((pem) => {
-    try {
-      // Format PEM to prevent "PEM routines::bad end line" errors
-      const sanitizedPem = cleanPem(pem);
-      const cert = new X509Certificate(sanitizedPem);
-      
-      // 1. Raw Hex Serial Number (lowercase)
-      const rawHexSerial = cert.serialNumber.toLowerCase().replace(/[^0-9a-f]/g, '');
-      
-      // 2. Clean Hex Serial Number (no leading zeros)
-      const cleanHexSerial = rawHexSerial.replace(/^0+/, '') || '0';
-      
-      // 3. Decimal Serial Number (Base-10 Conversion for Google's CRL JSON keys)
-      let decimalSerial = '';
-      try {
-        decimalSerial = BigInt('0x' + rawHexSerial).toString(10);
-      } catch (e) {}
+    const keysToCheck = getSerialKeys(pem);
 
-      // Check all key variations against Google's CRL entry list
-      const hitDecimal = crlData.entries[decimalSerial];
-      const hitRawHex = crlData.entries[rawHexSerial];
-      const hitCleanHex = crlData.entries[cleanHexSerial];
-
-      if (
-        (hitDecimal && hitDecimal.status === 'REVOKED') ||
-        (hitRawHex && hitRawHex.status === 'REVOKED') ||
-        (hitCleanHex && hitCleanHex.status === 'REVOKED')
-      ) {
+    for (const key of keysToCheck) {
+      if (crlData.entries[key] && crlData.entries[key].status === 'REVOKED') {
         isRevoked = true;
+        break;
       }
-    } catch (e) {
-      console.error("Cert parsing error:", e.message);
     }
   });
 
@@ -149,15 +145,13 @@ async function analyzeKeybox(xmlContent) {
     report += `**Integrity Breakdown:**\n`;
     report += `✅ **MEETS_BASIC_INTEGRITY**: Passed\n`;
     report += `✅ **MEETS_DEVICE_INTEGRITY**: Passed\n`;
-    report += `🛡️ **MEETS_STRONG_INTEGRITY**: Certificate is clean. Passing Strong Integrity depends on user's local TEE/StrongBox module setup or locked bootloader state.`;
+    report += `🛡️ **MEETS_STRONG_INTEGRITY**: Certificate is clean. Passing Strong Integrity depends on user's TEE/StrongBox module setup or locked bootloader state.`;
   }
 
   return report;
 }
 
-// ==========================================
-// 4. TELEGRAM BOT HANDLERS
-// ==========================================
+// 3. TELEGRAM BOT HANDLERS
 bot.onText(/\/start/, (msg) => {
   bot.sendMessage(
     msg.chat.id,
