@@ -233,15 +233,31 @@ bot.onText(/\/start/, (msg) => {
 
 bot.on('document', async (msg) => {
   const chatId = msg.chat.id;
+  const fileId = msg.document.file_id;
+
+  // Helper function to fetch the file with a retry
+  async function fetchFileWithRetry(retries = 3) {
+    for (let i = 0; i < retries; i++) {
+      try {
+        const fileLink = await bot.getFileLink(fileId);
+        const response = await axios.get(fileLink, { responseType: 'text' });
+        return response.data;
+      } catch (err) {
+        console.log(`Attempt ${i + 1} failed: ${err.message}`);
+        if (i === retries - 1) throw err; // Throw if all retries failed
+        // Wait 2 seconds before retrying
+        await new Promise(resolve => setTimeout(resolve, 2000)); 
+      }
+    }
+  }
+
   try {
-    const fileLink = await bot.getFileLink(msg.document.file_id);
-    const response = await axios.get(fileLink, { responseType: 'text' });
-    
     bot.sendMessage(chatId, "🔍 Analyzing Keybox against Google's Revocation List...");
-    const report = await analyzeKeybox(response.data);
+    const fileContent = await fetchFileWithRetry();
+    const report = await analyzeKeybox(fileContent);
     bot.sendMessage(chatId, report);
   } catch (err) {
-    bot.sendMessage(chatId, `❌ Error reading keybox file: ${err.message}`);
+    bot.sendMessage(chatId, `❌ Error reading keybox file after multiple attempts: ${err.message}`);
   }
 });
 
