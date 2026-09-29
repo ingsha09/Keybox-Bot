@@ -30,7 +30,8 @@ if (!TOKEN) {
 const bot = new TelegramBot(TOKEN, { polling: true });
 
 // FIX FOR 409 CONFLICT: Delete any existing webhooks before starting polling
-bot.deleteWebhook().then(() => {
+// Note: The method is "deleteWebHook" (capital H) in node-telegram-bot-api
+bot.deleteWebHook().then(() => {
     console.log("Webhook deleted, polling started.");
 }).catch(err => {
     console.error("Error deleting webhook:", err.message);
@@ -112,7 +113,6 @@ async function analyzeKeybox(xmlContent) {
       let serialNumber = cert.serialNumber.toString(16).toLowerCase();
       
       // Sometimes serial numbers are returned with leading '0' and Google doesn't use it
-      // or vice versa. We try both.
       const cleanSerial = serialNumber.replace(/^0+/, '');
       
       console.log(`[Cert ${index}] Checking Serial: ${serialNumber} (Clean: ${cleanSerial})`);
