@@ -42,13 +42,6 @@ async function fetchGoogleCRL() {
   }
 }
 
-// Normalizes hex strings (lowercases, removes invalid chars, and strips leading zeros)
-function normalizeHex(hexStr) {
-  if (!hexStr) return '';
-  let cleaned = hexStr.toLowerCase().replace(/[^0-9a-f]/g, '').replace(/^0+/, '');
-  return cleaned.length % 2 !== 0 ? '0' + cleaned : cleaned;
-}
-
 // Parse Keybox XML and extract PEM certificate blocks
 function parseKeybox(xmlData) {
   const parser = new XMLParser({ ignoreAttributes: false });
@@ -87,35 +80,43 @@ async function analyzeKeybox(xmlContent) {
   }
 
   const crlData = await fetchGoogleCRL();
-  if (!crlData) {
+  if (!crlData || !crlData.entries) {
     return "⚠️ **Error**: Could not fetch Google's revocation list. Please try again in a few moments.";
   }
 
   let isRevoked = false;
 
-  // Build a set of normalized revoked serial numbers from Google CRL
-  const revokedSerialsSet = new Set();
-  if (crlData && crlData.entries) {
-    Object.keys(crlData.entries).forEach((crlSerial) => {
-      if (crlData.entries[crlSerial].status === 'REVOKED') {
-        revokedSerialsSet.add(crlSerial.toLowerCase());
-        revokedSerialsSet.add(normalizeHex(crlSerial));
-      }
-    });
-  }
-
-  // Cross-reference extracted certificates against CRL set
+  // Cross-reference extracted certificates against CRL
   certPems.forEach((pem) => {
     try {
       const cert = new X509Certificate(pem);
-      const rawSerial = cert.serialNumber.toLowerCase();
-      const normSerial = normalizeHex(cert.serialNumber);
+      
+      // Get raw serial string (usually hex)
+      const hexSerial = cert.serialNumber.toLowerCase().replace(/[^0-9a-f]/g, '');
+      
+      // Convert serial to BigInt string decimal (Google often indexes CRL entries as Decimals)
+      let decSerial = '';
+      try {
+        decSerial = BigInt('0x' + hexSerial).toString();
+      } catch (e) {}
 
-      if (revokedSerialsSet.has(rawSerial) || revokedSerialsSet.has(normSerial)) {
-        isRevoked = true;
+      // Check all possible representations in Google's CRL JSON
+      for (const [crlKey, crlEntry] of Object.entries(crlData.entries)) {
+        const cleanCrlKey = crlKey.toLowerCase().replace(/[^0-9a-f]/g, '');
+
+        if (
+          cleanCrlKey === hexSerial ||
+          crlKey === decSerial ||
+          cleanCrlKey === hexSerial.replace(/^0+/, '')
+        ) {
+          if (crlEntry.status === 'REVOKED') {
+            isRevoked = true;
+            break;
+          }
+        }
       }
     } catch (e) {
-      // Ignore individually malformed certificate blocks
+      console.error("Cert parsing error:", e.message);
     }
   });
 
@@ -130,7 +131,7 @@ async function analyzeKeybox(xmlContent) {
     report += `**Integrity Breakdown:**\n`;
     report += `✅ **MEETS_BASIC_INTEGRITY**: Passed\n`;
     report += `✅ **MEETS_DEVICE_INTEGRITY**: Passed\n`;
-    report += `🛡️ **MEETS_STRONG_INTEGRITY**: Certificate is clean. Passing Strong Integrity will still depend on the user's local TEE/StrongBox module setup or locked bootloader state.`;
+    report += `🛡️️ **MEETS_STRONG_INTEGRITY**: Certificate is clean. Passing Strong Integrity will still depend on the user's local TEE/StrongBox module setup or locked bootloader state.`;
   }
 
   return report;
