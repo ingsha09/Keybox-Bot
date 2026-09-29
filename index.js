@@ -1,9 +1,22 @@
+const express = require('express');
 const TelegramBot = require('node-telegram-bot-api');
 const { XMLParser } = require('fast-xml-parser');
 const { X509Certificate } = require('@peculiar/x509');
 const axios = require('axios');
 
-// Fetch token from environment variables (configured on hosting dashboard)
+// Express server setup to keep Render awake
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+app.get('/', (req, res) => {
+  res.send('Keybox Bot is live and running!');
+});
+
+app.listen(PORT, () => {
+  console.log(`Keep-alive server listening on port ${PORT}`);
+});
+
+// Bot token initialization
 const TOKEN = process.env.BOT_TOKEN;
 if (!TOKEN) {
   console.error("FATAL: BOT_TOKEN environment variable is missing!");
@@ -114,4 +127,3 @@ bot.on('text', async (msg) => {
     bot.sendMessage(msg.chat.id, report, { parse_mode: 'Markdown' });
   }
 });
-  
