@@ -1,0 +1,15 @@
+{
+  "name": "keybox-checker-bot",
+  "version": "1.0.0",
+  "description": "Telegram bot to check keybox attestation status",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "axios": "^1.6.0",
+    "fast-xml-parser": "^4.3.0",
+    "node-telegram-bot-api": "^0.64.0",
+    "@peculiar/x509": "^1.11.0"
+  }
+}
