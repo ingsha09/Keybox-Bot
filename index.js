@@ -29,7 +29,6 @@ if (!TOKEN) {
 
 const bot = new TelegramBot(TOKEN, { polling: true });
 
-// FIX FOR 409 CONFLICT
 bot.deleteWebHook().then(() => {
     console.log("Webhook deleted, polling started.");
 }).catch(err => {
@@ -78,6 +77,16 @@ function parseKeybox(xmlData) {
   return certs;
 }
 
+// Helper to format a date safely
+function formatDate(date) {
+    if (!date) return 'Unknown';
+    try {
+        return date.toLocaleDateString('en-GB');
+    } catch (e) {
+        return 'Invalid Date';
+    }
+}
+
 async function analyzeKeybox(xmlContent) {
   let certPems;
   try {
@@ -96,68 +105,79 @@ async function analyzeKeybox(xmlContent) {
   }
 
   let isRevoked = false;
-  let revokedDetails = [];
   let hasExpiredCert = false;
   let earliestExpiryDate = null;
   let certReports = [];
+  let parsedCerts = [];
 
+  // Step 1: Parse all certificates first
   certPems.forEach((pem, index) => {
     try {
       const cert = new X509Certificate(pem);
-      let serialNumber = cert.serialNumber.toString(16).toLowerCase().replace(/^0x/, '');
-      const cleanSerial = serialNumber.replace(/^0+/, '');
-      
-      // 1. Check Revocation List
-      let revoked = false;
-      let revokeReason = '';
-      if (crlData.entries[serialNumber] || crlData.entries[cleanSerial]) {
-        const entry = crlData.entries[serialNumber] || crlData.entries[cleanSerial];
-        if (entry.status === 'REVOKED') {
-          revoked = true;
-          revokeReason = entry.reason || 'Unknown';
-          isRevoked = true;
-          revokedDetails.push(`Serial: ${serialNumber} - Reason: ${revokeReason}`);
-        }
-      }
+      parsedCerts.push({ index, cert, pem });
+    } catch (e) {
+      console.error(`Error parsing certificate at index ${index}:`, e.message);
+      certReports.push(`🔐 **Certificate ${index}**: ❌ Could not parse (Invalid format)\n`);
+      hasExpiredCert = true;
+    }
+  });
 
-      // 2. Check Expiry Dates
-      const notBefore = cert.notBefore;
-      const notAfter = cert.notAfter;
-      const now = new Date();
-      
-      const isExpired = now > notAfter;
-      const isNotYetValid = now < notBefore;
-      
-      if (isExpired) hasExpiredCert = true;
+  // Step 2: Analyze each certificate
+  parsedCerts.forEach(({ index, cert }) => {
+    const notBefore = cert.notBefore || new Date(0);
+    const notAfter = cert.notAfter || new Date(0);
+    const now = new Date();
+    
+    const isExpired = !cert.notAfter || now > notAfter;
+    const isNotYetValid = !cert.notBefore || now < notBefore;
+    
+    if (isExpired) hasExpiredCert = true;
 
-      // Track earliest expiry for the whole chain
+    if (notAfter && notAfter.getTime() > 0) {
       if (!earliestExpiryDate || notAfter < earliestExpiryDate) {
         earliestExpiryDate = notAfter;
       }
-
-      // Build detailed string for this certificate
-      let certMsg = `🔐 **Certificate ${index} Serial**: \`${serialNumber}\`\n`;
-      certMsg += `📅 Valid from: ${notBefore.toLocaleDateString('en-GB')} to: ${notAfter.toLocaleDateString('en-GB')}\n`;
-      
-      if (isExpired) {
-        certMsg += `❌ **Expired certificate**\n`;
-      } else if (isNotYetValid) {
-        certMsg += `❌ **Certificate not yet valid**\n`;
-      } else {
-        certMsg += `✅ Certificate within validity period\n`;
-      }
-
-      if (revoked) {
-        certMsg += `❌ **REVOKED in Google's list** (Reason: ${revokeReason})\n`;
-      } else {
-        certMsg += `✅ Serial number not found in Google's revoked keybox list\n`;
-      }
-
-      certReports.push(certMsg);
-
-    } catch (e) {
-      console.error(`Error parsing certificate at index ${index}:`, e.message);
     }
+
+    // Extract Subject Serial Number (SKI) and Basic Serial
+    const basicSerial = cert.serialNumber.toString(16).toLowerCase().replace(/^0x/, '');
+    const cleanSerial = basicSerial.replace(/^0+/, '');
+    
+    // Try to get the Subject Key Identifier (often used by other bots)
+    let subjectSerial = 'Not Found';
+    try {
+        // The subjectKeyIdentifier extension is often OID 2.5.29.14
+        const skiExt = cert.extensions.find(e => e.type === '2.5.29.14');
+        if (skiExt) {
+            subjectSerial = skiExt.value.toString('hex').toLowerCase();
+        }
+    } catch (e) { /* Ignore */ }
+
+    // Check Revocation
+    let revoked = false;
+    let revokeReason = '';
+    if (crlData.entries[basicSerial] || crlData.entries[cleanSerial]) {
+      const entry = crlData.entries[basicSerial] || crlData.entries[cleanSerial];
+      if (entry.status === 'REVOKED') {
+        revoked = true;
+        revokeReason = entry.reason || 'Unknown';
+        isRevoked = true;
+      }
+    }
+
+    // Build detailed string
+    let certMsg = `🔐 **Certificate ${index} Serial**: \`${basicSerial}\`\n`;
+    certMsg += `ℹ️ **Subject Serial**: \`${subjectSerial}\`\n`;
+    certMsg += `📅 Valid from: ${formatDate(notBefore)} to: ${formatDate(notAfter)}\n`;
+    
+    if (isExpired) certMsg += `❌ **Expired certificate**\n`;
+    else if (isNotYetValid) certMsg += `❌ **Certificate not yet valid**\n`;
+    else certMsg += `✅ Certificate within validity period\n`;
+
+    if (revoked) certMsg += `❌ **REVOKED in Google's list** (Reason: ${revokeReason})\n`;
+    else certMsg += `✅ Serial number not found in Google's revoked keybox list\n`;
+
+    certReports.push(certMsg);
   });
 
   // Build final report
@@ -171,20 +191,24 @@ async function analyzeKeybox(xmlContent) {
   if (isRevoked) {
     resultMsg += `• **Google Revocation Status**: 🔴 **REVOKED**\n`;
     resultMsg += `⚠️ *This keybox has been banned by Google. It will FAIL all Play Integrity checks.*\n`;
-    resultMsg += `**Revoked Details:**\n${revokedDetails.join('\n')}\n`;
   } else {
     resultMsg += `• **Google Revocation Status**: 🟢 **VALID (Not Revoked)**\n`;
   }
 
   if (hasExpiredCert) {
-    resultMsg += `\n• **Keybox Expiry Status**: ❌ **EXPIRED**\n`;
-    resultMsg += `⌛ Keybox expired on: ${earliestExpiryDate.toLocaleDateString('en-GB')}\n`;
-    resultMsg += `🔴 **This keybox CANNOT be used for Strong Integrity due to expired certificates.**\n`;
+    resultMsg += `\n• **Keybox Expiry Status**: ❌ **INVALID/EXPIRED**\n`;
+    if (earliestExpiryDate) {
+      resultMsg += `⌛ Keybox expired on: ${formatDate(earliestExpiryDate)}\n`;
+    }
+    resultMsg += `🔴 **This keybox CANNOT be used for Strong Integrity due to expired or invalid certificates.**\n`;
   } else {
     resultMsg += `\n• **Keybox Expiry Status**: ✅ **VALID**\n`;
-    resultMsg += `⌛ Keybox expires on: ${earliestExpiryDate.toLocaleDateString('en-GB')}\n`;
+    resultMsg += `⌛ Keybox expires on: ${formatDate(earliestExpiryDate)}\n`;
     resultMsg += `🛡️ **MEETS_STRONG_INTEGRITY**: Certificate is clean. Passing Strong Integrity will still depend on the user's local TEE/StrongBox module setup or locked bootloader state.`;
   }
+
+  // Add the disclaimer similar to other bots
+  resultMsg += `\n\n*Note: Sometimes Google bans a keybox without revoking it. This bot fetches the Google revocation list, but can't know if a keybox is banned via unofficial methods.*`;
 
   return resultMsg;
 }
