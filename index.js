@@ -54,7 +54,7 @@ async function fetchGoogleCRL() {
   }
 }
 
-// NEW: Aggressive cleaning and re-wrapping of certificates
+// Aggressive cleaning and re-wrapping of certificates
 function formatCertificate(rawString) {
     // 1. Remove all PEM headers if they exist
     let cleaned = rawString.replace(/-----BEGIN CERTIFICATE-----/g, '')
@@ -162,11 +162,12 @@ async function analyzeKeybox(xmlContent) {
     const basicSerial = cert.serialNumber.toString(16).toLowerCase().replace(/^0x/, '');
     const cleanSerial = basicSerial.replace(/^0+/, '');
     
+    // Properly convert ArrayBuffer to Hex String for Subject Serial
     let subjectSerial = 'Not Found';
     try {
         const skiExt = cert.extensions.find(e => e.type === '2.5.29.14');
         if (skiExt) {
-            subjectSerial = skiExt.value.toString('hex').toLowerCase();
+            subjectSerial = Buffer.from(skiExt.value).toString('hex').toLowerCase();
         }
     } catch (e) { /* Ignore */ }
 
@@ -202,7 +203,6 @@ async function analyzeKeybox(xmlContent) {
 
   resultMsg += `\n--- Summary ---\n`;
 
-  // FIX: Made the summary clearer and less misleading
   if (isRevoked) {
     resultMsg += `• Google Revocation Status: 🔴 REVOKED\n`;
     resultMsg += `⚠️ This keybox has been banned by Google.\n`;
