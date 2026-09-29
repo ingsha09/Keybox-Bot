@@ -27,15 +27,12 @@ if (!TOKEN) {
   process.exit(1);
 }
 
-// Use polling: false to avoid the 409 conflict during startup
 const bot = new TelegramBot(TOKEN, { polling: true });
 
-// Handle polling errors gracefully
 bot.on('polling_error', (error) => {
   console.log(`Polling error: ${error.code} - ${error.message}`);
 });
 
-// Forcefully delete webhook to allow polling
 bot.deleteWebHook().then(() => {
     console.log("Webhook deleted, polling started.");
 }).catch(err => {
@@ -57,6 +54,30 @@ async function fetchGoogleCRL() {
   }
 }
 
+// Helper to format certificates for the X509 library
+function formatCertificate(rawString) {
+    let cleaned = rawString.trim();
+
+    // Case 1: Already in PEM format
+    if (cleaned.includes('-----BEGIN CERTIFICATE-----')) {
+        return cleaned;
+    }
+
+    // Case 2: Raw Base64 string (no headers)
+    // Remove any whitespace/newlines
+    cleaned = cleaned.replace(/\s/g, '');
+
+    // Ensure it's a valid base64 length
+    if (cleaned.length > 100 && /^[A-Za-z0-9+/=]+$/.test(cleaned)) {
+        // Re-wrap in PEM format
+        const lines = cleaned.match(/.{1,64}/g) || [];
+        return `-----BEGIN CERTIFICATE-----\n${lines.join('\n')}\n-----END CERTIFICATE-----`;
+    }
+
+    // Fallback: return as-is (will likely throw an error, caught in the loop)
+    return cleaned;
+}
+
 function parseKeybox(xmlData) {
   const parser = new XMLParser({ 
     ignoreAttributes: false, 
@@ -68,9 +89,15 @@ function parseKeybox(xmlData) {
   const certs = [];
   
   const extractCerts = (node) => {
-    if (typeof node === 'string' && node.includes('-----BEGIN CERTIFICATE-----')) {
-      const pemMatches = node.match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g);
-      if (pemMatches) certs.push(...pemMatches);
+    if (typeof node === 'string') {
+        // Check for PEM or Base64 certificate patterns
+        if (node.includes('-----BEGIN CERTIFICATE-----')) {
+            const pemMatches = node.match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g);
+            if (pemMatches) certs.push(...pemMatches);
+        } else if (node.length > 100 && /^[A-Za-z0-9+/=\s]+$/.test(node)) {
+            // Looks like a raw Base64 certificate block
+            certs.push(node);
+        }
     } else if (Array.isArray(node)) {
       node.forEach(item => extractCerts(item));
     } else if (typeof node === 'object' && node !== null) {
@@ -94,14 +121,14 @@ function formatDate(date) {
 }
 
 async function analyzeKeybox(xmlContent) {
-  let certPems;
+  let rawCerts;
   try {
-    certPems = parseKeybox(xmlContent);
+    rawCerts = parseKeybox(xmlContent);
   } catch (e) {
     return "❌ Invalid Keybox XML File: Could not parse certificates.";
   }
 
-  if (certPems.length === 0) {
+  if (rawCerts.length === 0) {
     return "❌ Invalid Keybox: No certificate chains found.";
   }
 
@@ -116,10 +143,12 @@ async function analyzeKeybox(xmlContent) {
   let certReports = [];
   let parsedCerts = [];
 
-  certPems.forEach((pem, index) => {
+  // Step 1: Parse all certificates first
+  rawCerts.forEach((rawCert, index) => {
     try {
-      const cert = new X509Certificate(pem);
-      parsedCerts.push({ index, cert, pem });
+      const pemString = formatCertificate(rawCert);
+      const cert = new X509Certificate(pemString);
+      parsedCerts.push({ index, cert });
     } catch (e) {
       console.error(`Error parsing certificate at index ${index}:`, e.message);
       certReports.push(`🔐 Certificate ${index}: ❌ Could not parse (Invalid format)\n`);
@@ -127,6 +156,7 @@ async function analyzeKeybox(xmlContent) {
     }
   });
 
+  // Step 2: Analyze each certificate
   parsedCerts.forEach(({ index, cert }) => {
     const notBefore = cert.notBefore || new Date(0);
     const notAfter = cert.notAfter || new Date(0);
@@ -165,7 +195,6 @@ async function analyzeKeybox(xmlContent) {
       }
     }
 
-    // Plain text formatting to avoid Telegram 400 errors
     let certMsg = `🔐 Certificate ${index} Serial: ${basicSerial}\n`;
     certMsg += `ℹ️ Subject Serial: ${subjectSerial}\n`;
     certMsg += `📅 Valid from: ${formatDate(notBefore)} to: ${formatDate(notAfter)}\n`;
@@ -181,7 +210,7 @@ async function analyzeKeybox(xmlContent) {
   });
 
   let resultMsg = `📁 Keybox Analysis Report\n\n`;
-  resultMsg += `• Total Certs Found: ${certPems.length}\n\n`;
+  resultMsg += `• Total Certs Found: ${rawCerts.length}\n\n`;
   resultMsg += `--- Certificate Details ---\n\n`;
   resultMsg += certReports.join('\n');
 
@@ -223,7 +252,6 @@ bot.on('document', async (msg) => {
     
     bot.sendMessage(chatId, "🔍 Analyzing Keybox against Google's Revocation List...");
     const report = await analyzeKeybox(response.data);
-    // Send as PLAIN TEXT to avoid Markdown parsing errors
     bot.sendMessage(chatId, report);
   } catch (err) {
     bot.sendMessage(chatId, `❌ Error reading keybox file: ${err.message}`);
@@ -235,7 +263,6 @@ bot.on('text', async (msg) => {
   if (msg.text.includes('<?xml') || msg.text.includes('<Keybox') || msg.text.includes('<AndroidAttestation')) {
     bot.sendMessage(msg.chat.id, "🔍 Analyzing Keybox XML...");
     const report = await analyzeKeybox(msg.text);
-    // Send as PLAIN TEXT to avoid Markdown parsing errors
     bot.sendMessage(msg.chat.id, report);
   }
 });
