@@ -44,6 +44,21 @@ async function fetchGoogleCRL() {
   }
 }
 
+// Clean and format PEM blocks to prevent OpenSSL line-ending/parsing errors
+function cleanPem(pemStr) {
+  if (!pemStr) return '';
+  // Remove carriage returns (\r), XML entity escapes, and strip whitespace
+  let clean = pemStr.replace(/\r/g, '').replace(/&#13;/g, '').trim();
+  
+  // Ensure header and footer have proper Unix newline breaks
+  clean = clean.replace(/-----BEGIN CERTIFICATE-----/g, '-----BEGIN CERTIFICATE-----\n');
+  clean = clean.replace(/-----END CERTIFICATE-----/g, '\n-----END CERTIFICATE-----');
+  
+  // Filter empty lines and join cleanly
+  const lines = clean.split('\n').map(l => l.trim()).filter(Boolean);
+  return lines.join('\n');
+}
+
 // Extract all PEM certificates from the XML
 function parseKeyboxAllCerts(xmlData) {
   const parser = new XMLParser({ ignoreAttributes: false });
@@ -90,7 +105,9 @@ async function analyzeKeybox(xmlContent) {
 
   certPems.forEach((pem) => {
     try {
-      const cert = new X509Certificate(pem);
+      // Format PEM to prevent "PEM routines::bad end line" errors
+      const sanitizedPem = cleanPem(pem);
+      const cert = new X509Certificate(sanitizedPem);
       
       // 1. Raw Hex Serial Number (lowercase)
       const rawHexSerial = cert.serialNumber.toLowerCase().replace(/[^0-9a-f]/g, '');
@@ -104,7 +121,7 @@ async function analyzeKeybox(xmlContent) {
         decimalSerial = BigInt('0x' + rawHexSerial).toString(10);
       } catch (e) {}
 
-      // Check all three key variants against Google's CRL entry list
+      // Check all key variations against Google's CRL entry list
       const hitDecimal = crlData.entries[decimalSerial];
       const hitRawHex = crlData.entries[rawHexSerial];
       const hitCleanHex = crlData.entries[cleanHexSerial];
