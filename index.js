@@ -33,6 +33,10 @@ const GOOGLE_CRL_URL = 'https://android.googleapis.com/attestation/status';
 async function fetchGoogleCRL() {
   try {
     const response = await axios.get(GOOGLE_CRL_URL);
+    // Google's response might be a string if the content-type isn't json, so parse it if needed
+    if (typeof response.data === 'string') {
+      return JSON.parse(response.data);
+    }
     return response.data;
   } catch (error) {
     console.error("Failed to fetch Google CRL:", error.message);
@@ -41,13 +45,20 @@ async function fetchGoogleCRL() {
 }
 
 function parseKeybox(xmlData) {
-  const parser = new XMLParser({ ignoreAttributes: false });
+  const parser = new XMLParser({ 
+    ignoreAttributes: false, 
+    trimValues: true,
+    parseTagValue: false // IMPORTANT: Prevents parsing serial numbers as numbers
+  });
   const jsonObj = parser.parse(xmlData);
-  const keybox = jsonObj.AndroidAttestation || jsonObj.Keybox;
+  
+  // Standard Keybox root is usually <Keybox> or <AndroidAttestation>
+  const keybox = jsonObj.Keybox || jsonObj.AndroidAttestation;
   if (!keybox) throw new Error("Invalid Keybox XML structure.");
 
   const certs = [];
   const extractCerts = (node) => {
+    // Look for Certificate or X509Certificate tags specifically
     if (typeof node === 'string' && node.includes('-----BEGIN CERTIFICATE-----')) {
       const pemMatches = node.match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g);
       if (pemMatches) certs.push(...pemMatches);
@@ -73,19 +84,36 @@ async function analyzeKeybox(xmlContent) {
   }
 
   const crlData = await fetchGoogleCRL();
+  if (!crlData || !crlData.entries) {
+    return "❌ **Error**: Unable to fetch Google's Revocation List. Please try again later.";
+  }
+
   let isRevoked = false;
+  let revokedDetails = [];
 
   certPems.forEach((pem) => {
     try {
       const cert = new X509Certificate(pem);
-      const serialNumber = cert.serialNumber.toLowerCase();
+      // Use toString() or convert to hex string to ensure leading zeros are handled
+      const serialNumber = cert.serialNumber.toString(16).toLowerCase();
       
-      if (crlData && crlData.entries && crlData.entries[serialNumber]) {
-        if (crlData.entries[serialNumber].status === 'REVOKED') {
+      // Debug log to see what is being checked
+      console.log(`Checking Serial: ${serialNumber}`);
+
+      // Check if this specific serial number is in Google's CRL
+      if (crlData.entries[serialNumber]) {
+        const status = crlData.entries[serialNumber].status;
+        const reason = crlData.entries[serialNumber].reason;
+        console.log(`Found in CRL! Status: ${status}`);
+        
+        if (status === 'REVOKED') {
           isRevoked = true;
+          revokedDetails.push(`Serial: ${serialNumber} - Reason: ${reason}`);
         }
       }
-    } catch (e) {}
+    } catch (e) {
+      console.error("Error parsing certificate:", e.message);
+    }
   });
 
   let resultMsg = `📁 **Keybox Analysis Report**\n\n`;
@@ -93,7 +121,8 @@ async function analyzeKeybox(xmlContent) {
   
   if (isRevoked) {
     resultMsg += `• **Google Revocation Status**: 🔴 **REVOKED**\n\n`;
-    resultMsg += `⚠️ *This keybox has been banned by Google. It will FAIL all Play Integrity checks (Basic, Device, and Strong).*`;
+    resultMsg += `⚠️ *This keybox has been banned by Google. It will FAIL all Play Integrity checks (Basic, Device, and Strong).*\n\n`;
+    resultMsg += `**Revoked Details:**\n${revokedDetails.join('\n')}`;
   } else {
     resultMsg += `• **Google Revocation Status**: 🟢 **VALID (Not Revoked)**\n\n`;
     resultMsg += `**Integrity Breakdown:**\n`;
@@ -125,7 +154,7 @@ bot.on('document', async (msg) => {
 
 bot.on('text', async (msg) => {
   if (msg.text.startsWith('/')) return;
-  if (msg.text.includes('<?xml') || msg.text.includes('<AndroidAttestation')) {
+  if (msg.text.includes('<?xml') || msg.text.includes('<Keybox')) {
     bot.sendMessage(msg.chat.id, "🔍 Analyzing Keybox XML...");
     const report = await analyzeKeybox(msg.text);
     bot.sendMessage(msg.chat.id, report, { parse_mode: 'Markdown' });
