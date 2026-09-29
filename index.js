@@ -54,28 +54,18 @@ async function fetchGoogleCRL() {
   }
 }
 
-// Helper to format certificates for the X509 library
+// NEW: Aggressive cleaning and re-wrapping of certificates
 function formatCertificate(rawString) {
-    let cleaned = rawString.trim();
-
-    // Case 1: Already in PEM format
-    if (cleaned.includes('-----BEGIN CERTIFICATE-----')) {
-        return cleaned;
-    }
-
-    // Case 2: Raw Base64 string (no headers)
-    // Remove any whitespace/newlines
+    // 1. Remove all PEM headers if they exist
+    let cleaned = rawString.replace(/-----BEGIN CERTIFICATE-----/g, '')
+                           .replace(/-----END CERTIFICATE-----/g, '');
+    
+    // 2. Remove ALL whitespace (spaces, tabs, newlines)
     cleaned = cleaned.replace(/\s/g, '');
 
-    // Ensure it's a valid base64 length
-    if (cleaned.length > 100 && /^[A-Za-z0-9+/=]+$/.test(cleaned)) {
-        // Re-wrap in PEM format
-        const lines = cleaned.match(/.{1,64}/g) || [];
-        return `-----BEGIN CERTIFICATE-----\n${lines.join('\n')}\n-----END CERTIFICATE-----`;
-    }
-
-    // Fallback: return as-is (will likely throw an error, caught in the loop)
-    return cleaned;
+    // 3. Re-wrap in standard PEM format (64 chars per line)
+    const lines = cleaned.match(/.{1,64}/g) || [];
+    return `-----BEGIN CERTIFICATE-----\n${lines.join('\n')}\n-----END CERTIFICATE-----`;
 }
 
 function parseKeybox(xmlData) {
@@ -90,12 +80,8 @@ function parseKeybox(xmlData) {
   
   const extractCerts = (node) => {
     if (typeof node === 'string') {
-        // Check for PEM or Base64 certificate patterns
-        if (node.includes('-----BEGIN CERTIFICATE-----')) {
-            const pemMatches = node.match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g);
-            if (pemMatches) certs.push(...pemMatches);
-        } else if (node.length > 100 && /^[A-Za-z0-9+/=\s]+$/.test(node)) {
-            // Looks like a raw Base64 certificate block
+        // Match both PEM and raw Base64 strings
+        if (node.includes('-----BEGIN CERTIFICATE-----') || (node.length > 200 && /^[A-Za-z0-9+/=\s]+$/.test(node))) {
             certs.push(node);
         }
     } else if (Array.isArray(node)) {
@@ -216,23 +202,24 @@ async function analyzeKeybox(xmlContent) {
 
   resultMsg += `\n--- Summary ---\n`;
 
+  // FIX: Made the summary clearer and less misleading
   if (isRevoked) {
     resultMsg += `• Google Revocation Status: 🔴 REVOKED\n`;
-    resultMsg += `⚠️ This keybox has been banned by Google. It will FAIL all Play Integrity checks.\n`;
+    resultMsg += `⚠️ This keybox has been banned by Google.\n`;
   } else {
-    resultMsg += `• Google Revocation Status: 🟢 VALID (Not Revoked)\n`;
+    resultMsg += `• Google Revocation Status: 🟢 NOT REVOKED\n`;
   }
 
   if (hasExpiredCert) {
-    resultMsg += `\n• Keybox Expiry Status: ❌ INVALID/EXPIRED\n`;
+    resultMsg += `\n• Keybox Expiry Status: ❌ EXPIRED / INVALID\n`;
     if (earliestExpiryDate) {
       resultMsg += `⌛ Keybox expired on: ${formatDate(earliestExpiryDate)}\n`;
     }
-    resultMsg += `🔴 This keybox CANNOT be used for Strong Integrity due to expired or invalid certificates.\n`;
+    resultMsg += `🔴 THIS KEYBOX CANNOT BE USED FOR STRONG INTEGRITY.\n`;
   } else {
     resultMsg += `\n• Keybox Expiry Status: ✅ VALID\n`;
     resultMsg += `⌛ Keybox expires on: ${formatDate(earliestExpiryDate)}\n`;
-    resultMsg += `🛡️ MEETS_STRONG_INTEGRITY: Certificate is clean. Passing Strong Integrity will still depend on the user's local TEE/StrongBox module setup or locked bootloader state.\n`;
+    resultMsg += `🛡️ This keybox is clean and can be used for Strong Integrity (assuming local TEE setup is correct).\n`;
   }
 
   resultMsg += `\n\nNote: Sometimes Google bans a keybox without revoking it. This bot fetches the Google revocation list, but can't know if a keybox is banned via unofficial methods.`;
