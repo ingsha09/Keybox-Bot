@@ -57,35 +57,52 @@ const KNOWN_GOOGLE_INTERMEDIATES = [
     'Google'
 ];
 
+// Cache with refresh interval
 let googleCRL = null;
-let privateBanList = new Set();
+let lastCRLFetch = 0;
+const CRL_CACHE_DURATION = 30 * 60 * 1000; // 30 minutes
+
+let privateBanList = null;
+let lastBanListFetch = 0;
+const BAN_LIST_CACHE_DURATION = 30 * 60 * 1000; // 30 minutes
 
 async function fetchGoogleCRL() {
-  if (googleCRL) return googleCRL;
+  const now = Date.now();
+  if (googleCRL && (now - lastCRLFetch) < CRL_CACHE_DURATION) {
+    return googleCRL;
+  }
   try {
     const response = await axios.get(GOOGLE_CRL_URL);
     googleCRL = typeof response.data === 'string' ? JSON.parse(response.data) : response.data;
+    lastCRLFetch = now;
+    console.log(`Fetched Google CRL: ${Object.keys(googleCRL.entries).length} entries.`);
     return googleCRL;
   } catch (error) {
     console.error("Failed to fetch Google CRL:", error.message);
-    return null;
+    return googleCRL; // Return stale cache if fetch fails
   }
 }
 
 async function fetchPrivateBanList() {
-  if (privateBanList.size > 0) return privateBanList;
+  const now = Date.now();
+  if (privateBanList && (now - lastBanListFetch) < BAN_LIST_CACHE_DURATION) {
+    return privateBanList;
+  }
   try {
     const response = await axios.get(PRIVATE_BAN_LIST_URL);
     const lines = response.data.split('\n');
+    const newSet = new Set();
     for (const line of lines) {
         const serial = line.trim().toLowerCase();
-        if (serial) privateBanList.add(serial);
+        if (serial) newSet.add(serial);
     }
+    privateBanList = newSet;
+    lastBanListFetch = now;
     console.log(`Loaded ${privateBanList.size} banned serials from private list.`);
     return privateBanList;
   } catch (error) {
     console.error("Failed to fetch private ban list:", error.message);
-    return null;
+    return privateBanList;
   }
 }
 
@@ -137,19 +154,31 @@ function formatDate(date) {
     }
 }
 
-// Convert a serial number to hex (handles decimal and hex inputs)
-function normalizeSerial(serialNumber) {
-    let serialStr = serialNumber.toString().toLowerCase().replace(/^0x/, '');
-    
-    if (/^\d+$/.test(serialStr)) {
+// Get all possible serial number formats for CRL matching
+function getSerialVariants(cert) {
+    const variants = [];
+    try {
+        // Get raw hex string from certificate
+        let rawHex = cert.serialNumber.toString(16).toLowerCase().replace(/^0x/, '');
+        variants.push(rawHex);
+        
+        // Remove leading zeros
+        const cleanHex = rawHex.replace(/^0+/, '');
+        if (cleanHex && cleanHex !== rawHex) variants.push(cleanHex);
+        
+        // Convert hex to decimal (Google often uses decimal in CRL)
         try {
-            serialStr = BigInt(serialStr).toString(16);
-        } catch (e) {
-            // If BigInt fails, it's probably already hex
-        }
+            const decimal = BigInt('0x' + rawHex).toString();
+            variants.push(decimal);
+        } catch (e) { /* Ignore BigInt errors */ }
+        
+        // Also try the raw serial as-is (in case the library returns decimal)
+        const rawSerial = cert.serialNumber.toString().toLowerCase().replace(/^0x/, '');
+        if (!variants.includes(rawSerial)) variants.push(rawSerial);
+    } catch (e) {
+        console.error("Error generating serial variants:", e.message);
     }
-    
-    return serialStr.replace(/^0+/, '');
+    return variants;
 }
 
 // ==========================================
@@ -213,9 +242,9 @@ async function analyzeKeybox(xmlContent) {
       }
     }
 
-    // Get the raw serial (as it appears in the cert) and the normalized hex
-    const rawSerial = cert.serialNumber.toString().toLowerCase().replace(/^0x/, '');
-    const basicSerial = normalizeSerial(cert.serialNumber);
+    // Get all serial variants for CRL matching
+    const serialVariants = getSerialVariants(cert);
+    const primarySerial = serialVariants[0]; // hex form for display
     
     // Extract Subject Serial Number (SKI)
     let subjectSerial = 'Not Found';
@@ -227,19 +256,20 @@ async function analyzeKeybox(xmlContent) {
     } catch (e) { /* Ignore */ }
 
     // ============================================
-    // CRITICAL FIX: Check BOTH raw decimal AND hex serials against CRL
-    // Google sometimes lists bans under the decimal format, not hex
+    // CRITICAL: Check CRL against ALL serial variants
+    // Google's CRL mixes decimal and hex formats
     // ============================================
     let revoked = false;
     let revokeReason = '';
-    const serialsToCheck = [rawSerial, basicSerial];
+    let matchedSerial = '';
     
-    for (const serial of serialsToCheck) {
-        if (crlData.entries[serial]) {
-            const entry = crlData.entries[serial];
+    for (const variant of serialVariants) {
+        if (crlData.entries[variant]) {
+            const entry = crlData.entries[variant];
             if (entry.status === 'REVOKED') {
                 revoked = true;
                 revokeReason = entry.reason || 'Unknown';
+                matchedSerial = variant;
                 isRevoked = true;
                 break;
             }
@@ -256,7 +286,7 @@ async function analyzeKeybox(xmlContent) {
         }
     }
 
-    // Check Root/Intermediate Certificate
+    // Check Root/Intermediate
     let rootStatus = '';
     if (isRoot) {
         const subjectName = cert.subjectName ? cert.subjectName.toString() : '';
@@ -284,7 +314,7 @@ async function analyzeKeybox(xmlContent) {
         }
     }
 
-    let certMsg = `🔐 Certificate ${index} Serial: ${basicSerial}\n`;
+    let certMsg = `🔐 Certificate ${index} Serial: ${primarySerial}\n`;
     certMsg += `ℹ️ Subject Serial: ${subjectSerial}\n`;
     certMsg += `📅 Valid from: ${formatDate(notBefore)} to: ${formatDate(notAfter)}\n`;
     
@@ -306,7 +336,7 @@ async function analyzeKeybox(xmlContent) {
     certReports.push(certMsg);
   });
 
-  // Step 3: Build the final report
+  // Step 3: Build final report
   let resultMsg = `📁 Keybox Analysis Report\n\n`;
   resultMsg += `• Total Certs Found: ${rawCerts.length}\n\n`;
   resultMsg += `--- Certificate Details ---\n\n`;
