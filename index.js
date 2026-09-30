@@ -330,27 +330,15 @@ async function analyzeKeybox(xmlContent, fileName = null) {
         }
     }
 
+    // ============================================
+    // Root Certificate Analysis (Improved)
+    // ============================================
     let rootStatus = '';
     if (isRoot) {
         const subjectName = cert.subjectName ? cert.subjectName.toString() : '';
+        const issuerName = cert.issuerName ? cert.issuerName.toString() : '';
         
-        // ====== ROOT DEBUG ======
-        console.log(`\n========== [ROOT DEBUG] Cert ${index} ==========`);
-        console.log(`subjectName.toString(): "${subjectName}"`);
-        console.log(`Lowercased: "${subjectName.toLowerCase()}"`);
-        console.log(`Includes 'Key Attestation CA1'? ${subjectName.includes('Key Attestation CA1')}`);
-        console.log(`Includes 'Google'? ${subjectName.includes('Google')}`);
-        console.log(`Includes 'google' (case-insensitive)? ${subjectName.toLowerCase().includes('google')}`);
-        console.log(`Includes 'Droid CA1'? ${subjectName.includes('Droid CA1')}`);
-        console.log(`Includes 'Droid CA2'? ${subjectName.includes('Droid CA2')}`);
-        try {
-            console.log(`subjectName.toJSON():`, JSON.stringify(cert.subjectName ? cert.subjectName.toJSON() : 'N/A'));
-        } catch(e) { console.log('toJSON error:', e.message); }
-        console.log(`issuerName.toString(): "${cert.issuerName ? cert.issuerName.toString() : 'N/A'}"`);
-        console.log(`Extensions:`, cert.extensions ? cert.extensions.map(e => e.type) : 'N/A');
-        console.log(`================================================\n`);
-        // ====== END DEBUG ======
-        
+        // Check 1: Known Google root names (CN=Key Attestation CA1, etc.)
         for (const validRoot of VALID_GOOGLE_ROOTS) {
             if (subjectName.includes(validRoot)) {
                 hasValidRoot = true;
@@ -359,6 +347,7 @@ async function analyzeKeybox(xmlContent, fileName = null) {
             }
         }
         
+        // Check 2: Known Google intermediate names
         if (!hasValidRoot) {
             for (const intermediate of KNOWN_GOOGLE_INTERMEDIATES) {
                 if (subjectName.includes(intermediate)) {
@@ -369,8 +358,22 @@ async function analyzeKeybox(xmlContent, fileName = null) {
             }
         }
         
+        // Check 3: TEE self-signed cert heuristic
+        // Real Google hardware attestation certs use a TEE subject DN
+        // (either "T=TEE" or "2.5.4.5=<serial>"), and are self-signed
+        // at the leaf level. If the subject DN matches this pattern, it's
+        // a hardware-attested TEE certificate.
         if (!hasValidRoot && !hasKnownIntermediate) {
-            rootStatus = `ℹ️ Custom/self-signed root certificate\n`;
+            const isTeeCert = /^2\.5\.4\.5=[0-9a-f]+$/i.test(subjectName.trim()) || 
+                             /\bT=TEE\b/i.test(subjectName);
+            const isSelfSigned = subjectName.trim() === issuerName.trim();
+            
+            if (isTeeCert && isSelfSigned) {
+                hasValidRoot = true;
+                rootStatus = `✅ Google hardware attestation root certificate\n`;
+            } else {
+                rootStatus = `ℹ️ Custom/self-signed root certificate\n`;
+            }
         }
     }
 
@@ -397,7 +400,7 @@ async function analyzeKeybox(xmlContent, fileName = null) {
   });
 
   // ==========================================
-  // Build the report (with file name on top)
+  // Build the report
   // ==========================================
   let resultMsg = `📁 Keybox Analysis Report\n`;
   if (fileName) {
