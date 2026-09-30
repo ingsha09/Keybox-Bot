@@ -165,60 +165,64 @@ function getSerialVariants(cert) {
 }
 
 // ==========================================
-// CORRECTED: Extract Subject Serial Number (SKI) properly
+// CORRECTED: Extract Subject Serial from DN "serialNumber" attribute
 // ==========================================
 function getSubjectSerials(cert) {
     const candidates = new Set();
     
-    // Method 1: Extract 'serialNumber' attribute from Subject DN
-    // This is what most Android keyboxes use and what ban lists reference.
+    // Method 1: Parse the DN string for "serialNumber=..." (case-insensitive)
+    // This is what Android keyboxes actually use, and what the ban list references.
+    try {
+        const dnString = cert.subjectName ? cert.subjectName.toString() : '';
+        
+        const serialMatch = dnString.match(/serialNumber\s*=\s*([0-9a-fA-F]+)/i);
+        if (serialMatch && serialMatch[1]) {
+            const val = serialMatch[1].toLowerCase();
+            candidates.add(val);
+            candidates.add(val.replace(/^0+/, ''));
+            candidates.add(val.replace(/^04/, ''));
+        }
+    } catch (e) { /* Ignore */ }
+    
+    // Method 2: Try getField with various name formats
     try {
         const subject = cert.subjectName;
         if (subject) {
-            // Try common DN attribute names for serial
-            const attributeNames = ['serialNumber', '2.5.4.5', 'SERIALNUMBER'];
-            for (const attrName of attributeNames) {
+            for (const name of ['serialNumber', 'SERIALNUMBER', '2.5.4.5']) {
                 try {
-                    const fields = subject.getField(attrName);
+                    const fields = subject.getField(name);
                     if (fields && fields.length > 0) {
                         for (const field of fields) {
-                            let val = field.value.toString().trim().toLowerCase();
-                            if (val) {
+                            let val = '';
+                            if (typeof field.value === 'string') {
+                                val = field.value;
+                            } else if (field.value instanceof ArrayBuffer) {
+                                val = Buffer.from(field.value).toString('utf-8');
+                            } else if (field.value) {
+                                val = field.value.toString();
+                            }
+                            val = val.trim().toLowerCase();
+                            if (val && /^[0-9a-f]+$/.test(val)) {
                                 candidates.add(val);
-                                // Also strip leading zeros and '04' prefix
                                 candidates.add(val.replace(/^0+/, ''));
                                 candidates.add(val.replace(/^04/, ''));
                             }
                         }
                     }
-                } catch (e) { /* Try next attribute name */ }
+                } catch (e) { /* Try next name */ }
             }
         }
     } catch (e) { /* Ignore */ }
     
-    // Method 2: Extract Subject Key Identifier (SKI) extension (2.5.29.14)
-    // Strip the DER wrapper (04 + length) to get the raw hash.
+    // Method 3: SKI extension as a fallback
     try {
         const skiExt = cert.extensions.find(e => e.type === '2.5.29.14');
         if (skiExt) {
             let rawHex = Buffer.from(skiExt.value).toString('hex').toLowerCase();
-            
-            // DER wrapper for OCTET STRING is: 04 <length>
-            // For a 20-byte SKI, the wrapper is 04 14.
-            if (rawHex.startsWith('0414')) {
-                rawHex = rawHex.substring(4);
-            } else if (rawHex.startsWith('04')) {
-                // Generic case: read the length byte
-                const lenByte = parseInt(rawHex.substring(2, 4), 16);
-                if (!isNaN(lenByte) && lenByte > 0) {
-                    rawHex = rawHex.substring(4, 4 + lenByte * 2);
-                }
-            }
-            
+            if (rawHex.startsWith('0414')) rawHex = rawHex.substring(4);
             if (rawHex) {
                 candidates.add(rawHex);
                 candidates.add(rawHex.replace(/^0+/, ''));
-                candidates.add(rawHex.replace(/^04/, ''));
             }
         }
     } catch (e) { /* Ignore */ }
@@ -288,7 +292,7 @@ async function analyzeKeybox(xmlContent) {
     const serialVariants = getSerialVariants(cert);
     const primarySerial = serialVariants[0];
     
-    // Get all Subject Serial candidates (DN attribute + SKI extension)
+    // Get ALL subject serial candidates (DN attribute + SKI fallback)
     const subjectSerials = getSubjectSerials(cert);
     const primarySubjectSerial = subjectSerials.length > 0 ? subjectSerials[0] : 'Not Found';
 
@@ -308,10 +312,9 @@ async function analyzeKeybox(xmlContent) {
         }
     }
 
-    // Check private ban list against ALL serial variants
+    // Check private ban list against ALL candidates (basic + subject)
     let privatelyBanned = false;
     if (banList) {
-        // Check both Basic Serial variants AND Subject Serial variants
         for (const variant of serialVariants) {
             if (banList.has(variant)) {
                 privatelyBanned = true;
