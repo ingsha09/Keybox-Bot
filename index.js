@@ -134,40 +134,30 @@ function formatDate(date) {
     }
 }
 
-// Generate all possible serial number variants for CRL matching
-// This handles the case where Google's CRL uses decimal but the cert library returns hex, and vice versa
 function getSerialVariants(cert) {
     const variants = new Set();
     try {
-        // Get raw serial (as returned by the library)
         let rawSerial = cert.serialNumber.toString().toLowerCase().replace(/^0x/, '');
-        
-        // Always add raw
         variants.add(rawSerial);
         
-        // If raw looks decimal, convert to hex
         if (/^\d+$/.test(rawSerial)) {
             try {
                 const hex = BigInt(rawSerial).toString(16);
                 variants.add(hex);
                 variants.add(hex.replace(/^0+/, ''));
             } catch (e) { /* Ignore */ }
-        } 
-        // If raw looks hex, convert to decimal
-        else if (/^[0-9a-f]+$/.test(rawSerial)) {
+        } else if (/^[0-9a-f]+$/.test(rawSerial)) {
             try {
                 const decimal = BigInt('0x' + rawSerial).toString();
                 variants.add(decimal);
             } catch (e) { /* Ignore */ }
         }
         
-        // Also try the .toString(16) variant in case it differs
         let hexSerial = cert.serialNumber.toString(16).toLowerCase().replace(/^0x/, '');
         if (hexSerial && hexSerial !== rawSerial) {
             variants.add(hexSerial);
             variants.add(hexSerial.replace(/^0+/, ''));
         }
-        
     } catch (e) {
         console.error("Error generating serial variants:", e.message);
     }
@@ -189,7 +179,6 @@ async function analyzeKeybox(xmlContent) {
     return "❌ Invalid Keybox: No certificate chains found.";
   }
 
-  // Fetch fresh data on every check
   const crlData = await fetchGoogleCRL();
   const banList = await fetchPrivateBanList();
   
@@ -206,7 +195,6 @@ async function analyzeKeybox(xmlContent) {
   let hasValidRoot = false;
   let hasKnownIntermediate = false;
 
-  // Step 1: Parse all certificates
   rawCerts.forEach((rawCert, index) => {
     try {
       const pemString = formatCertificate(rawCert);
@@ -219,7 +207,6 @@ async function analyzeKeybox(xmlContent) {
     }
   });
 
-  // Step 2: Analyze each certificate
   parsedCerts.forEach(({ index, cert, isRoot }) => {
     const notBefore = cert.notBefore || new Date(0);
     const notAfter = cert.notAfter || new Date(0);
@@ -236,11 +223,9 @@ async function analyzeKeybox(xmlContent) {
       }
     }
 
-    // Get all serial variants for CRL matching
     const serialVariants = getSerialVariants(cert);
     const primarySerial = serialVariants[0];
     
-    // Extract Subject Serial Number (SKI)
     let subjectSerial = 'Not Found';
     try {
         const skiExt = cert.extensions.find(e => e.type === '2.5.29.14');
@@ -249,7 +234,6 @@ async function analyzeKeybox(xmlContent) {
         }
     } catch (e) { /* Ignore */ }
 
-    // Check CRL against ALL serial variants
     let revoked = false;
     let revokeReason = '';
     
@@ -265,7 +249,6 @@ async function analyzeKeybox(xmlContent) {
         }
     }
 
-    // Check Private Ban List (Subject Serial)
     let privatelyBanned = false;
     if (banList && subjectSerial !== 'Not Found') {
         const cleanSubjectSerial = subjectSerial.replace(/^04/, '');
@@ -275,7 +258,6 @@ async function analyzeKeybox(xmlContent) {
         }
     }
 
-    // Check Root/Intermediate
     let rootStatus = '';
     if (isRoot) {
         const subjectName = cert.subjectName ? cert.subjectName.toString() : '';
@@ -325,7 +307,6 @@ async function analyzeKeybox(xmlContent) {
     certReports.push(certMsg);
   });
 
-  // Step 3: Build final report
   let resultMsg = `📁 Keybox Analysis Report\n\n`;
   resultMsg += `• Total Certs Found: ${rawCerts.length}\n\n`;
   resultMsg += `--- Certificate Details ---\n\n`;
@@ -378,7 +359,48 @@ async function analyzeKeybox(xmlContent) {
 }
 
 // ==========================================
-// 6. BOT HANDLERS
+// 6. HELPER: Process and reply (edit instead of new message)
+// ==========================================
+async function processKeybox(chatId, xmlContent, statusMessageId = null) {
+    // Send typing indicator (lasts 5 seconds)
+    bot.sendChatAction(chatId, 'typing').catch(() => {});
+    
+    // If we don't have an existing status message, send one
+    let messageId = statusMessageId;
+    if (!messageId) {
+        const statusMsg = await bot.sendMessage(chatId, "🔍 Analyzing Keybox against Google's Revocation List...");
+        messageId = statusMsg.message_id;
+    }
+    
+    try {
+        const report = await analyzeKeybox(xmlContent);
+        
+        // Edit the status message with the final report
+        // If editing fails (e.g., message too old), send a new message
+        try {
+            await bot.editMessageText(report, {
+                chat_id: chatId,
+                message_id: messageId
+            });
+        } catch (editErr) {
+            console.log(`Failed to edit message, sending new one: ${editErr.message}`);
+            await bot.sendMessage(chatId, report);
+        }
+    } catch (err) {
+        const errorMsg = `❌ Error analyzing keybox: ${err.message}`;
+        try {
+            await bot.editMessageText(errorMsg, {
+                chat_id: chatId,
+                message_id: messageId
+            });
+        } catch (editErr) {
+            await bot.sendMessage(chatId, errorMsg);
+        }
+    }
+}
+
+// ==========================================
+// 7. BOT HANDLERS
 // ==========================================
 bot.onText(/\/start/, (msg) => {
   bot.sendMessage(msg.chat.id, "Welcome! Upload your keybox.xml file or paste its contents here to check its Google Attestation status.");
@@ -403,10 +425,11 @@ bot.on('document', async (msg) => {
   }
 
   try {
-    bot.sendMessage(chatId, "🔍 Analyzing Keybox against Google's Revocation List...");
+    // Send the initial status message
+    const statusMsg = await bot.sendMessage(chatId, "🔍 Analyzing Keybox against Google's Revocation List...");
+    
     const fileContent = await fetchFileWithRetry();
-    const report = await analyzeKeybox(fileContent);
-    bot.sendMessage(chatId, report);
+    await processKeybox(chatId, fileContent, statusMsg.message_id);
   } catch (err) {
     bot.sendMessage(chatId, `❌ Error reading keybox file after multiple attempts: ${err.message}`);
   }
@@ -415,8 +438,8 @@ bot.on('document', async (msg) => {
 bot.on('text', async (msg) => {
   if (msg.text.startsWith('/')) return;
   if (msg.text.includes('<?xml') || msg.text.includes('<Keybox') || msg.text.includes('<AndroidAttestation')) {
-    bot.sendMessage(msg.chat.id, "🔍 Analyzing Keybox XML...");
-    const report = await analyzeKeybox(msg.text);
-    bot.sendMessage(msg.chat.id, report);
+    // Send the initial status message
+    const statusMsg = await bot.sendMessage(msg.chat.id, "🔍 Analyzing Keybox XML...");
+    await processKeybox(msg.chat.id, msg.text, statusMsg.message_id);
   }
 });
