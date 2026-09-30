@@ -159,7 +159,6 @@ function parseKeybox(xmlData) {
     }
   });
   
-  // Fallback: extract all certs as one chain
   if (chains.length === 0) {
     const allCerts = [];
     const extractAll = (node) => {
@@ -632,7 +631,7 @@ I analyze Android keybox XML files and check them against:
 • Full chain trust validation
 
 📄 *How to use:*
-Just upload your \`keybox.xml\` file, or paste the raw XML contents directly in the chat.
+Just upload your \`keybox.xml\` file. The bot analyzes files only — pasted text won't work reliably because Telegram splits long messages.
 
 Use /help for detailed information about what I check and my limitations.`;
 
@@ -657,7 +656,9 @@ bot.onText(/\/help/, (msg) => {
 A keybox is an XML file containing cryptographic certificates used to pass Google Play Integrity's checks on Android devices.
 
 *How do I check one?*
-Upload a \`keybox.xml\` file or paste the raw XML content. I'll analyze every certificate in every chain.
+Upload a \`keybox.xml\` file using the 📎 attach button. 
+
+⚠️ *Important:* Pasting raw XML text usually doesn't work because Telegram splits long messages into chunks. Please always upload the .xml file.
 
 *What do you check?*
 ✅ *Google CRL* – Official list of revoked keyboxes
@@ -772,7 +773,7 @@ bot.on('callback_query', async (query) => {
 });
 
 // ==========================================
-// 8. FILE & TEXT HANDLERS
+// 8. FILE HANDLER (No text handler — files only)
 // ==========================================
 bot.on('document', async (msg) => {
   const chatId = msg.chat.id;
@@ -780,13 +781,12 @@ bot.on('document', async (msg) => {
   const fileName = msg.document.file_name || '';
   const lowerName = fileName.toLowerCase();
 
-  // Only process files that look like keybox XML files.
-  // Silently ignore everything else (ZIPs, APKs, images, PDFs, etc.).
+  // Only process .xml files or files with "keybox" in the name
   const isXmlFile = lowerName.endsWith('.xml');
   const hasKeyboxInName = lowerName.includes('keybox');
 
   if (!isXmlFile && !hasKeyboxInName) {
-    return; // Silent ignore
+    return; // Silently ignore everything else
   }
 
   async function fetchFileWithRetry(retries = 3) {
@@ -812,20 +812,13 @@ bot.on('document', async (msg) => {
   }
 });
 
-bot.on('text', async (msg) => {
-  if (msg.text.startsWith('/')) return;
-  if (msg.text.includes('<?xml') || msg.text.includes('<Keybox') || msg.text.includes('<AndroidAttestation')) {
-    const statusMsg = await bot.sendMessage(msg.chat.id, "🔍 Analyzing Keybox XML...");
-    await processKeybox(msg.chat.id, msg.text, statusMsg.message_id, 'Pasted XML');
-  }
-});
+// NOTE: There is no `bot.on('text')` handler on purpose.
+// Pasted XML text is ignored because Telegram splits long messages
+// into chunks, which breaks parsing. Users must upload the .xml file.
 
 // ==========================================
 // 9. EXPLICITLY DO NOTHING ON NEW MEMBERS
 // ==========================================
-// This is a safeguard: even if a handler for this event is
-// accidentally added in the future, this one prevents any
-// unwanted greeting messages in group chats.
 bot.on('new_chat_members', () => {
     // Intentionally empty — do not greet new members
 });
