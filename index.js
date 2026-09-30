@@ -164,17 +164,11 @@ function getSerialVariants(cert) {
     return Array.from(variants);
 }
 
-// ==========================================
-// CORRECTED: Extract Subject Serial from DN "serialNumber" attribute
-// ==========================================
 function getSubjectSerials(cert) {
     const candidates = new Set();
     
-    // Method 1: Parse the DN string for "serialNumber=..." (case-insensitive)
-    // This is what Android keyboxes actually use, and what the ban list references.
     try {
         const dnString = cert.subjectName ? cert.subjectName.toString() : '';
-        
         const serialMatch = dnString.match(/serialNumber\s*=\s*([0-9a-fA-F]+)/i);
         if (serialMatch && serialMatch[1]) {
             const val = serialMatch[1].toLowerCase();
@@ -184,7 +178,6 @@ function getSubjectSerials(cert) {
         }
     } catch (e) { /* Ignore */ }
     
-    // Method 2: Try getField with various name formats
     try {
         const subject = cert.subjectName;
         if (subject) {
@@ -214,7 +207,6 @@ function getSubjectSerials(cert) {
         }
     } catch (e) { /* Ignore */ }
     
-    // Method 3: SKI extension as a fallback
     try {
         const skiExt = cert.extensions.find(e => e.type === '2.5.29.14');
         if (skiExt) {
@@ -266,6 +258,23 @@ async function analyzeKeybox(xmlContent) {
       const pemString = formatCertificate(rawCert);
       const cert = new X509Certificate(pemString);
       parsedCerts.push({ index, cert, isRoot: index === rawCerts.length - 1 });
+
+      // ==== TEMPORARY DEBUG ====
+      try {
+          console.log(`\n========== DEBUG Cert ${index} ==========`);
+          console.log('subjectName.toString():', cert.subjectName ? cert.subjectName.toString() : 'N/A');
+          const subject = cert.subjectName;
+          if (subject) {
+              console.log('subject.names (JSON):', JSON.stringify(subject.names || []));
+              console.log('subject.toJSON():', JSON.stringify(subject.toJSON ? subject.toJSON() : 'N/A'));
+          }
+          console.log('Extensions:', cert.extensions ? cert.extensions.map(e => e.type) : 'N/A');
+          console.log('======================\n');
+      } catch (e) {
+          console.log(`Debug error Cert ${index}:`, e.message);
+      }
+      // ==== END DEBUG ====
+
     } catch (e) {
       console.error(`Error parsing certificate at index ${index}:`, e.message);
       certReports.push(`🔐 Certificate ${index}: ❌ Could not parse (Invalid format)\n`);
@@ -292,11 +301,9 @@ async function analyzeKeybox(xmlContent) {
     const serialVariants = getSerialVariants(cert);
     const primarySerial = serialVariants[0];
     
-    // Get ALL subject serial candidates (DN attribute + SKI fallback)
     const subjectSerials = getSubjectSerials(cert);
     const primarySubjectSerial = subjectSerials.length > 0 ? subjectSerials[0] : 'Not Found';
 
-    // Check Google's official CRL
     let revoked = false;
     let revokeReason = '';
     
@@ -312,7 +319,6 @@ async function analyzeKeybox(xmlContent) {
         }
     }
 
-    // Check private ban list against ALL candidates (basic + subject)
     let privatelyBanned = false;
     if (banList) {
         for (const variant of serialVariants) {
@@ -333,7 +339,6 @@ async function analyzeKeybox(xmlContent) {
         }
     }
 
-    // Check Root/Intermediate
     let rootStatus = '';
     if (isRoot) {
         const subjectName = cert.subjectName ? cert.subjectName.toString() : '';
