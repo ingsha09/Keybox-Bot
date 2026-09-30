@@ -273,6 +273,8 @@ async function analyzeKeybox(xmlContent, fileName = null) {
     }
   });
 
+  const totalCertsInChain = parsedCerts.length;
+
   parsedCerts.forEach(({ index, cert, isRoot }) => {
     const notBefore = cert.notBefore || new Date(0);
     const notAfter = cert.notAfter || new Date(0);
@@ -331,48 +333,63 @@ async function analyzeKeybox(xmlContent, fileName = null) {
     }
 
     // ============================================
-    // Root Certificate Analysis (Improved)
+    // Root Certificate Analysis (Fixed)
     // ============================================
     let rootStatus = '';
     if (isRoot) {
         const subjectName = cert.subjectName ? cert.subjectName.toString() : '';
         const issuerName = cert.issuerName ? cert.issuerName.toString() : '';
+        const subjectTrimmed = subjectName.trim();
         
         // Check 1: Known Google root names (CN=Key Attestation CA1, etc.)
+        let isKnownRoot = false;
         for (const validRoot of VALID_GOOGLE_ROOTS) {
             if (subjectName.includes(validRoot)) {
                 hasValidRoot = true;
                 rootStatus = `✅ Google hardware attestation root certificate\n`;
+                isKnownRoot = true;
                 break;
             }
         }
         
-        // Check 2: Known Google intermediate names
-        if (!hasValidRoot) {
-            for (const intermediate of KNOWN_GOOGLE_INTERMEDIATES) {
-                if (subjectName.includes(intermediate)) {
-                    hasKnownIntermediate = true;
-                    rootStatus = `ℹ️ Known Google Intermediate (not hardware root)\n`;
-                    break;
-                }
-            }
-        }
-        
-        // Check 3: TEE self-signed cert heuristic
-        // Real Google hardware attestation certs use a TEE subject DN
-        // (either "T=TEE" or "2.5.4.5=<serial>"), and are self-signed
-        // at the leaf level. If the subject DN matches this pattern, it's
-        // a hardware-attested TEE certificate.
-        if (!hasValidRoot && !hasKnownIntermediate) {
-            const isTeeCert = /^2\.5\.4\.5=[0-9a-f]+$/i.test(subjectName.trim()) || 
-                             /\bT=TEE\b/i.test(subjectName);
-            const isSelfSigned = subjectName.trim() === issuerName.trim();
+        if (!isKnownRoot) {
+            // Detect DN patterns
+            const isTeeIntermediate = /\bT=TEE\b/i.test(subjectName);
+            const isTeeRoot = /^SERIALNUMBER=[0-9a-f]+$/i.test(subjectTrimmed) || 
+                             /^2\.5\.4\.5=[0-9a-f]+$/i.test(subjectTrimmed);
+            const isSelfSigned = subjectTrimmed === issuerName.trim();
             
-            if (isTeeCert && isSelfSigned) {
+            if (isTeeRoot && isSelfSigned && totalCertsInChain > 1) {
+                // Real TEE root — part of a proper multi-cert chain,
+                // self-signed, and uses the TEE root DN format.
+                // The Key Attestation app verifies these against Google's
+                // known public key, so we trust the chain structure.
                 hasValidRoot = true;
                 rootStatus = `✅ Google hardware attestation root certificate\n`;
-            } else {
+            } else if (isTeeRoot && isSelfSigned && totalCertsInChain === 1) {
+                // Single self-signed cert mimicking a TEE root.
+                // This is the signature of a fake keybox — real TEE roots
+                // are never the only cert in a chain.
                 rootStatus = `ℹ️ Custom/self-signed root certificate\n`;
+            } else if (isTeeIntermediate) {
+                // TEE intermediate cert (has T=TEE)
+                hasKnownIntermediate = true;
+                rootStatus = `ℹ️ Known Google Intermediate (not hardware root)\n`;
+            } else {
+                // Fallback: check for Google in DN
+                let foundGoogle = false;
+                for (const intermediate of KNOWN_GOOGLE_INTERMEDIATES) {
+                    if (subjectName.includes(intermediate)) {
+                        hasKnownIntermediate = true;
+                        rootStatus = `ℹ️ Known Google Intermediate (not hardware root)\n`;
+                        foundGoogle = true;
+                        break;
+                    }
+                }
+                
+                if (!foundGoogle) {
+                    rootStatus = `ℹ️ Custom/self-signed root certificate\n`;
+                }
             }
         }
     }
@@ -499,6 +516,7 @@ I analyze Android keybox XML files and check them against:
 • Google's Certificate Revocation List (CRL)
 • A community-maintained private ban list
 • Certificate expiration dates
+• Root certificate type
 
 📄 *How to use:*
 Just upload your \`keybox.xml\` file, or paste the raw XML contents directly in the chat.
@@ -532,13 +550,14 @@ Upload a \`keybox.xml\` file or paste the raw XML content. I'll analyze every ce
 ✅ *Google CRL* – Official list of revoked keyboxes
 ✅ *Private Ban List* – Community-maintained list of unofficially banned keyboxes
 ✅ *Expiration Dates* – Whether any certificate in the chain has expired
+✅ *Root Certificate* – Whether the chain terminates at a valid Google root
 
 *What do the results mean?*
 🟢 *CAN BE USED* – Not revoked, not banned, not expired
 🔴 *CANNOT BE USED* – Revoked, banned, or expired
 
 *Why does "Custom / Self-Signed" root appear?*
-Almost all community keyboxes use custom or self-signed roots — this is completely normal and doesn't affect whether the keybox can be used. It's shown for informational purposes only.
+Community keyboxes often use custom or self-signed roots. This is normal and shown for informational purposes only.
 
 *Limitations*
 • Google sometimes bans keyboxes *without* revoking them. No bot can detect these bans.
