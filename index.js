@@ -279,8 +279,8 @@ async function analyzeKeybox(xmlContent, fileName = null) {
 
   // ============================================
   // Step 2: Pre-scan chain for structural integrity
-  // Only structural failures (revoked / expired) break the chain.
-  // Private bans do NOT break the chain — they only affect usage.
+  // Only revocation and expiration break the chain.
+  // Private bans do NOT break the chain — they only affect Strong.
   // ============================================
   const chainStatus = {
       hasRevoked: false,
@@ -288,13 +288,11 @@ async function analyzeKeybox(xmlContent, fileName = null) {
   };
 
   parsedCerts.forEach(({ cert }) => {
-      // Check expiry (structural)
       const notAfter = cert.notAfter;
       if (!notAfter || new Date() > notAfter) {
           chainStatus.hasExpired = true;
       }
       
-      // Check Google CRL revocation (structural)
       const serialVariants = getSerialVariants(cert);
       for (const variant of serialVariants) {
           if (crlData.entries[variant] && crlData.entries[variant].status === 'REVOKED') {
@@ -362,11 +360,7 @@ async function analyzeKeybox(xmlContent, fileName = null) {
         }
     }
 
-    // ============================================
     // Root Certificate Analysis
-    // Only structural issues (revoked/expired) make the root unknown.
-    // A privately banned keybox can still have a valid Google root.
-    // ============================================
     let rootStatus = '';
     if (isRoot) {
         const subjectName = cert.subjectName ? cert.subjectName.toString() : '';
@@ -386,7 +380,6 @@ async function analyzeKeybox(xmlContent, fileName = null) {
         const isTeeIntermediate = /\bT=TEE\b/i.test(subjectName);
         const isSelfSigned = subjectTrimmed === issuerName.trim();
         
-        // Structural failure: revocation or expiry makes the chain invalid
         if (chainStatus.hasRevoked) {
             rootClassification = 'chain-broken';
             rootStatus = `❌ Unknown root certificate due to revocation of a certificate\n`;
@@ -449,7 +442,9 @@ async function analyzeKeybox(xmlContent, fileName = null) {
     certReports.push(certMsg);
   });
 
+  // ==========================================
   // Step 4: Build the report
+  // ==========================================
   let resultMsg = `📁 Keybox Analysis Report\n`;
   if (fileName) {
     resultMsg += `📄 File: ${fileName}\n`;
@@ -487,8 +482,33 @@ async function analyzeKeybox(xmlContent, fileName = null) {
     resultMsg += `⌛ Keybox expires on: ${formatDate(earliestExpiryDate)}\n`;
   }
 
-  resultMsg += `\n`;
+  // ==========================================
+  // Integrity Predictions
+  // Based on real-world behavior:
+  // - Revoked or Expired → all checks fail
+  // - Privately Banned → Basic + Device pass, Strong fails
+  // - Clean + Valid Google root → all pass
+  // - Clean + unknown root → Basic + Device pass, Strong fails
+  // ==========================================
+  const cryptographicallyValid = !isRevoked && !hasExpiredCert;
   
+  const basicPasses  = cryptographicallyValid;
+  const devicePasses = cryptographicallyValid;
+  const strongPasses = cryptographicallyValid && !isPrivatelyBanned && (hasValidRoot || hasKnownIntermediate);
+  
+  resultMsg += `\n--- Integrity Predictions ---\n`;
+  resultMsg += basicPasses
+    ? `✅ MEETS_BASIC_INTEGRITY: Expected to pass\n`
+    : `❌ MEETS_BASIC_INTEGRITY: Expected to fail\n`;
+  resultMsg += devicePasses
+    ? `✅ MEETS_DEVICE_INTEGRITY: Expected to pass\n`
+    : `❌ MEETS_DEVICE_INTEGRITY: Expected to fail\n`;
+  resultMsg += strongPasses
+    ? `✅ MEETS_STRONG_INTEGRITY: Expected to pass\n`
+    : `❌ MEETS_STRONG_INTEGRITY: Expected to fail\n`;
+
+  // Final verdict
+  resultMsg += `\n`;
   if (isDefinitelyBad) {
     resultMsg += `🔴 THIS KEYBOX CANNOT BE USED FOR STRONG INTEGRITY.\n`;
   } else {
@@ -572,7 +592,7 @@ bot.onText(/\/help/, (msg) => {
 `📖 *Help & FAQ*
 
 *What is a keybox?*
-A keybox is an XML file containing cryptographic certificates used to pass Google Play Integrity's *Strong Integrity* check on Android devices.
+A keybox is an XML file containing cryptographic certificates used to pass Google Play Integrity's checks on Android devices.
 
 *How do I check one?*
 Upload a \`keybox.xml\` file or paste the raw XML content. I'll analyze every certificate in the chain.
@@ -587,19 +607,17 @@ Upload a \`keybox.xml\` file or paste the raw XML content. I'll analyze every ce
 🟢 *CAN BE USED* – Not revoked, not banned, not expired
 🔴 *CANNOT BE USED* – Revoked, banned, or expired
 
-*Why does "Custom / Self-Signed" root appear?*
-Community keyboxes often use custom or self-signed roots. This is normal and shown for informational purposes only.
+*Integrity Predictions:*
+The bot predicts which integrity levels you might pass:
+• *Basic/Device* – Pass unless the keybox is revoked or expired
+• *Strong* – Requires a valid, unrevoked, unbanned, unexpired keybox with a Google root
 
 *Limitations*
 • Google sometimes bans keyboxes *without* revoking them. No bot can detect these bans.
-• Both lists are public; private/unpublished bans cannot be detected.
+• Predictions are based on public data and real-world behavior — actual results may vary.
 
 *Commands*
-/start – Welcome message
-/help – This help message
-/about – About this bot
-/status – Check bot and data source status
-/source – Show data source URLs`;
+/start /help /about /status /source`;
 
     bot.sendMessage(chatId, text, { parse_mode: 'Markdown' });
 });
