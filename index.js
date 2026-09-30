@@ -334,6 +334,23 @@ async function analyzeKeybox(xmlContent, fileName = null) {
     if (isRoot) {
         const subjectName = cert.subjectName ? cert.subjectName.toString() : '';
         
+        // ====== ROOT DEBUG ======
+        console.log(`\n========== [ROOT DEBUG] Cert ${index} ==========`);
+        console.log(`subjectName.toString(): "${subjectName}"`);
+        console.log(`Lowercased: "${subjectName.toLowerCase()}"`);
+        console.log(`Includes 'Key Attestation CA1'? ${subjectName.includes('Key Attestation CA1')}`);
+        console.log(`Includes 'Google'? ${subjectName.includes('Google')}`);
+        console.log(`Includes 'google' (case-insensitive)? ${subjectName.toLowerCase().includes('google')}`);
+        console.log(`Includes 'Droid CA1'? ${subjectName.includes('Droid CA1')}`);
+        console.log(`Includes 'Droid CA2'? ${subjectName.includes('Droid CA2')}`);
+        try {
+            console.log(`subjectName.toJSON():`, JSON.stringify(cert.subjectName ? cert.subjectName.toJSON() : 'N/A'));
+        } catch(e) { console.log('toJSON error:', e.message); }
+        console.log(`issuerName.toString(): "${cert.issuerName ? cert.issuerName.toString() : 'N/A'}"`);
+        console.log(`Extensions:`, cert.extensions ? cert.extensions.map(e => e.type) : 'N/A');
+        console.log(`================================================\n`);
+        // ====== END DEBUG ======
+        
         for (const validRoot of VALID_GOOGLE_ROOTS) {
             if (subjectName.includes(validRoot)) {
                 hasValidRoot = true;
