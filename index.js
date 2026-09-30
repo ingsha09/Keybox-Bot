@@ -362,9 +362,6 @@ async function analyzeKeybox(xmlContent) {
 // 6. HELPER: Process and reply (edit instead of new message)
 // ==========================================
 async function processKeybox(chatId, xmlContent, statusMessageId = null) {
-    // Send typing indicator (lasts 5 seconds)
-    bot.sendChatAction(chatId, 'typing').catch(() => {});
-    
     // If we don't have an existing status message, send one
     let messageId = statusMessageId;
     if (!messageId) {
@@ -376,7 +373,6 @@ async function processKeybox(chatId, xmlContent, statusMessageId = null) {
         const report = await analyzeKeybox(xmlContent);
         
         // Edit the status message with the final report
-        // If editing fails (e.g., message too old), send a new message
         try {
             await bot.editMessageText(report, {
                 chat_id: chatId,
@@ -425,9 +421,7 @@ bot.on('document', async (msg) => {
   }
 
   try {
-    // Send the initial status message
     const statusMsg = await bot.sendMessage(chatId, "🔍 Analyzing Keybox against Google's Revocation List...");
-    
     const fileContent = await fetchFileWithRetry();
     await processKeybox(chatId, fileContent, statusMsg.message_id);
   } catch (err) {
@@ -438,7 +432,6 @@ bot.on('document', async (msg) => {
 bot.on('text', async (msg) => {
   if (msg.text.startsWith('/')) return;
   if (msg.text.includes('<?xml') || msg.text.includes('<Keybox') || msg.text.includes('<AndroidAttestation')) {
-    // Send the initial status message
     const statusMsg = await bot.sendMessage(msg.chat.id, "🔍 Analyzing Keybox XML...");
     await processKeybox(msg.chat.id, msg.text, statusMsg.message_id);
   }
