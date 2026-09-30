@@ -233,7 +233,7 @@ function getSubjectSerials(cert) {
 // ==========================================
 // 5. MAIN ANALYSIS FUNCTION
 // ==========================================
-async function analyzeKeybox(xmlContent) {
+async function analyzeKeybox(xmlContent, fileName = null) {
   let rawCerts;
   try {
     rawCerts = parseKeybox(xmlContent);
@@ -379,19 +379,20 @@ async function analyzeKeybox(xmlContent) {
     certReports.push(certMsg);
   });
 
-  // Build the report
-  let resultMsg = `📁 Keybox Analysis Report\n\n`;
+  // ==========================================
+  // Build the report (with file name on top)
+  // ==========================================
+  let resultMsg = `📁 Keybox Analysis Report\n`;
+  if (fileName) {
+    resultMsg += `📄 File: ${fileName}\n`;
+  }
+  resultMsg += `\n`;
   resultMsg += `• Total Certs Found: ${rawCerts.length}\n\n`;
   resultMsg += `--- Certificate Details ---\n\n`;
   resultMsg += certReports.join('\n');
 
   resultMsg += `\n--- Summary ---\n`;
 
-  // ==========================================
-  // ADAPTIVE SUMMARY
-  // If the keybox is bad, show only what's wrong.
-  // If good, show all clear signals.
-  // ==========================================
   const isDefinitelyBad = isRevoked || isPrivatelyBanned || hasExpiredCert;
 
   if (isRevoked) {
@@ -406,7 +407,6 @@ async function analyzeKeybox(xmlContent) {
       resultMsg += `⌛ Expired on: ${formatDate(earliestExpiryDate)}\n`;
     }
   } else {
-    // Clean keybox — show all clear signals
     resultMsg += `• Google Revocation Status: 🟢 NOT REVOKED\n`;
     resultMsg += `• Private Ban List: 🟢 NOT BANNED\n`;
     if (hasValidRoot) {
@@ -419,7 +419,6 @@ async function analyzeKeybox(xmlContent) {
     resultMsg += `⌛ Keybox expires on: ${formatDate(earliestExpiryDate)}\n`;
   }
 
-  // Final verdict
   resultMsg += `\n`;
   
   if (isDefinitelyBad) {
@@ -436,7 +435,7 @@ async function analyzeKeybox(xmlContent) {
 // ==========================================
 // 6. HELPER: Process and reply
 // ==========================================
-async function processKeybox(chatId, xmlContent, statusMessageId = null) {
+async function processKeybox(chatId, xmlContent, statusMessageId = null, fileName = null) {
     let messageId = statusMessageId;
     if (!messageId) {
         const statusMsg = await bot.sendMessage(chatId, "🔍 Analyzing Keybox against Google's Revocation List...");
@@ -444,7 +443,7 @@ async function processKeybox(chatId, xmlContent, statusMessageId = null) {
     }
     
     try {
-        const report = await analyzeKeybox(xmlContent);
+        const report = await analyzeKeybox(xmlContent, fileName);
         
         try {
             await bot.editMessageText(report, {
@@ -629,6 +628,7 @@ bot.on('callback_query', async (query) => {
 bot.on('document', async (msg) => {
   const chatId = msg.chat.id;
   const fileId = msg.document.file_id;
+  const fileName = msg.document.file_name || 'keybox.xml';
 
   async function fetchFileWithRetry(retries = 3) {
     for (let i = 0; i < retries; i++) {
@@ -647,7 +647,7 @@ bot.on('document', async (msg) => {
   try {
     const statusMsg = await bot.sendMessage(chatId, "🔍 Analyzing Keybox against Google's Revocation List...");
     const fileContent = await fetchFileWithRetry();
-    await processKeybox(chatId, fileContent, statusMsg.message_id);
+    await processKeybox(chatId, fileContent, statusMsg.message_id, fileName);
   } catch (err) {
     bot.sendMessage(chatId, `❌ Error reading keybox file after multiple attempts: ${err.message}`);
   }
@@ -657,6 +657,6 @@ bot.on('text', async (msg) => {
   if (msg.text.startsWith('/')) return;
   if (msg.text.includes('<?xml') || msg.text.includes('<Keybox') || msg.text.includes('<AndroidAttestation')) {
     const statusMsg = await bot.sendMessage(msg.chat.id, "🔍 Analyzing Keybox XML...");
-    await processKeybox(msg.chat.id, msg.text, statusMsg.message_id);
+    await processKeybox(msg.chat.id, msg.text, statusMsg.message_id, 'Pasted XML');
   }
 });
