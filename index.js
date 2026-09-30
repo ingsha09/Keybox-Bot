@@ -164,16 +164,12 @@ function getSerialVariants(cert) {
     return Array.from(variants);
 }
 
-// ==========================================
-// CORRECTED: Extract Subject Serial from OID 2.5.4.5
-// ==========================================
 function getSubjectSerials(cert) {
     const candidates = new Set();
     
     try {
         const dnString = cert.subjectName ? cert.subjectName.toString() : '';
         
-        // Match both "serialNumber=..." and "2.5.4.5=..." (OID format)
         const patterns = [
             /serialNumber\s*=\s*([0-9a-fA-F]+)/i,
             /2\.5\.4\.5\s*=\s*([0-9a-fA-F]+)/i
@@ -190,7 +186,6 @@ function getSubjectSerials(cert) {
         }
     } catch (e) { /* Ignore */ }
     
-    // Also try getField for both names
     try {
         const subject = cert.subjectName;
         if (subject) {
@@ -220,7 +215,6 @@ function getSubjectSerials(cert) {
         }
     } catch (e) { /* Ignore */ }
     
-    // SKI extension as last-resort fallback
     try {
         const skiExt = cert.extensions.find(e => e.type === '2.5.29.14');
         if (skiExt) {
@@ -437,7 +431,7 @@ async function analyzeKeybox(xmlContent) {
 }
 
 // ==========================================
-// 6. HELPER: Process and reply (edit instead of new message)
+// 6. HELPER: Process and reply
 // ==========================================
 async function processKeybox(chatId, xmlContent, statusMessageId = null) {
     let messageId = statusMessageId;
@@ -472,12 +466,162 @@ async function processKeybox(chatId, xmlContent, statusMessageId = null) {
 }
 
 // ==========================================
-// 7. BOT HANDLERS
+// 7. COMMAND HANDLERS
 // ==========================================
+
+// /start — Welcome message with inline keyboard
 bot.onText(/\/start/, (msg) => {
-  bot.sendMessage(msg.chat.id, "Welcome! Upload your keybox.xml file or paste its contents here to check its Google Attestation status.");
+    const chatId = msg.chat.id;
+    const text = 
+`👋 *Welcome to Keybox Checker Bot!*
+
+I analyze Android keybox XML files and check them against:
+• Google's Certificate Revocation List (CRL)
+• A community-maintained private ban list
+• Certificate expiration dates
+• Root certificate validation
+
+📄 *How to use:*
+Just upload your \`keybox.xml\` file, or paste the raw XML contents directly in the chat.
+
+Use /help for detailed information about what I check and my limitations.`;
+
+    bot.sendMessage(chatId, text, {
+        parse_mode: 'Markdown',
+        reply_markup: {
+            inline_keyboard: [
+                [{ text: '📖 Help / FAQ', callback_data: 'help' }],
+                [{ text: 'ℹ️ About', callback_data: 'about' }],
+                [{ text: '📊 Status', callback_data: 'status' }]
+            ]
+        }
+    });
 });
 
+// /help — Full FAQ
+bot.onText(/\/help/, (msg) => {
+    const chatId = msg.chat.id;
+    const text = 
+`📖 *Help & FAQ*
+
+*What is a keybox?*
+A keybox is an XML file containing cryptographic certificates used to pass Google Play Integrity's *Strong Integrity* check on Android devices.
+
+*How do I check one?*
+Upload a \`keybox.xml\` file or paste the raw XML content. I'll analyze every certificate in the chain.
+
+*What do you check?*
+✅ *Google CRL* – Official list of revoked keyboxes
+✅ *Private Ban List* – Community-maintained list of unofficially banned keyboxes
+✅ *Expiration Dates* – Whether any certificate in the chain has expired
+✅ *Root Certificate* – Whether the chain terminates at a known Google root
+
+*What do the results mean?*
+🔴 *CANNOT BE USED* – The keybox is revoked, banned, or expired
+🛡️ *CAN BE USED* – Clean, hardware-backed, and valid
+⚠️ *MIGHT WORK* – Valid but not hardware-backed (custom/self-signed root)
+
+*Why does "Unknown root" appear?*
+Most community keyboxes use custom or self-signed roots. These may still pass some integrity checks but aren't guaranteed to pass Strong Integrity.
+
+*Limitations*
+• Google sometimes bans keyboxes *without* revoking them. No bot can detect these bans.
+• Both lists are public; private/unpublished bans cannot be detected.
+
+*Commands*
+/start – Welcome message
+/help – This help message
+/about – About this bot
+/status – Check bot and data source status`;
+
+    bot.sendMessage(chatId, text, { parse_mode: 'Markdown' });
+});
+
+// /about — About the bot
+bot.onText(/\/about/, (msg) => {
+    const chatId = msg.chat.id;
+    const text = 
+`ℹ️ *About Keybox Checker Bot*
+
+A free, community-oriented tool to help you verify the status of Android keybox XML files.
+
+*Version:* 1.0
+*Data Sources:*
+• Google Attestation CRL (official)
+• Community ban list (daboynb/autojson)
+
+*Built with:*
+• Node.js + Telegraf
+• @peculiar/x509
+• fast-xml-parser
+• Hosted on Render
+
+*Disclaimer:*
+This bot does not store your files or any personal data. All analysis is done in-memory and discarded immediately after the report is sent.
+
+*Not affiliated with Google or Android.*
+
+Use /help for usage instructions.`;
+
+    bot.sendMessage(chatId, text, { parse_mode: 'Markdown' });
+});
+
+// /status — Bot and data source health check
+bot.onText(/\/status/, async (msg) => {
+    const chatId = msg.chat.id;
+    const statusMsg = await bot.sendMessage(chatId, "⏳ Checking system status...");
+    
+    try {
+        const startTime = Date.now();
+        const crl = await fetchGoogleCRL();
+        const banList = await fetchPrivateBanList();
+        const elapsed = Date.now() - startTime;
+        
+        const crlOk = crl && crl.entries && Object.keys(crl.entries).length > 0;
+        const banListOk = banList && banList.size > 0;
+        
+        let text = `📊 *System Status*\n\n`;
+        text += `🟢 *Bot*: Online\n`;
+        text += `⏱️ *Response Time*: ${elapsed}ms\n\n`;
+        text += `*Data Sources:*\n`;
+        text += crlOk ? `✅ Google CRL: ${Object.keys(crl.entries).length} entries\n` : `❌ Google CRL: Unreachable\n`;
+        text += banListOk ? `✅ Private Ban List: ${banList.size} serials\n` : `❌ Private Ban List: Unreachable\n`;
+        text += `\n${crlOk && banListOk ? '🟢 All systems operational.' : '🟡 Partial service — some checks may fail.'}`;
+        
+        bot.editMessageText(text, {
+            chat_id: chatId,
+            message_id: statusMsg.message_id,
+            parse_mode: 'Markdown'
+        });
+    } catch (err) {
+        bot.editMessageText(`❌ Status check failed: ${err.message}`, {
+            chat_id: chatId,
+            message_id: statusMsg.message_id
+        });
+    }
+});
+
+// Handle inline keyboard button clicks
+bot.on('callback_query', async (query) => {
+    const chatId = query.message.chat.id;
+    const data = query.data;
+    
+    let text = '';
+    if (data === 'help') {
+        text = `📖 Use /help for the full guide.`;
+    } else if (data === 'about') {
+        text = `ℹ️ Use /about for details about this bot.`;
+    } else if (data === 'status') {
+        text = `📊 Use /status to check system health.`;
+    }
+    
+    bot.answerCallbackQuery(query.id, { text: 'Opening...' });
+    if (text) bot.sendMessage(chatId, text);
+});
+
+// ==========================================
+// 8. FILE & TEXT HANDLERS
+// ==========================================
 bot.on('document', async (msg) => {
   const chatId = msg.chat.id;
   const fileId = msg.document.file_id;
