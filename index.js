@@ -39,31 +39,59 @@ bot.deleteWebHook().then(() => {
     console.error("Error deleting webhook:", err.message);
 });
 
+// ==========================================
+// 3. DATA SOURCES
+// ==========================================
 const GOOGLE_CRL_URL = 'https://android.googleapis.com/attestation/status';
+// Private ban list maintained by the community (used by other bots)
+const PRIVATE_BAN_LIST_URL = 'https://raw.githubusercontent.com/daboynb/autojson/refs/heads/main/banned.txt';
+// Known valid Google Hardware Attestation Root Certificate Subject Names
+const VALID_GOOGLE_ROOTS = [
+    'Google Hardware Attestation Root',
+    'Key Attestation CA1',
+    'Droid CA1',
+    'Droid CA2'
+];
+
+let googleCRL = null;
+let privateBanList = new Set();
 
 async function fetchGoogleCRL() {
+  if (googleCRL) return googleCRL;
   try {
     const response = await axios.get(GOOGLE_CRL_URL);
-    if (typeof response.data === 'string') {
-      return JSON.parse(response.data);
-    }
-    return response.data;
+    googleCRL = typeof response.data === 'string' ? JSON.parse(response.data) : response.data;
+    return googleCRL;
   } catch (error) {
     console.error("Failed to fetch Google CRL:", error.message);
     return null;
   }
 }
 
-// Aggressive cleaning and re-wrapping of certificates
+async function fetchPrivateBanList() {
+  if (privateBanList.size > 0) return privateBanList;
+  try {
+    const response = await axios.get(PRIVATE_BAN_LIST_URL);
+    const lines = response.data.split('\n');
+    for (const line of lines) {
+        const serial = line.trim().toLowerCase();
+        if (serial) privateBanList.add(serial);
+    }
+    console.log(`Loaded ${privateBanList.size} banned serials from private list.`);
+    return privateBanList;
+  } catch (error) {
+    console.error("Failed to fetch private ban list:", error.message);
+    return null;
+  }
+}
+
+// ==========================================
+// 4. HELPER FUNCTIONS
+// ==========================================
 function formatCertificate(rawString) {
-    // 1. Remove all PEM headers if they exist
     let cleaned = rawString.replace(/-----BEGIN CERTIFICATE-----/g, '')
                            .replace(/-----END CERTIFICATE-----/g, '');
-    
-    // 2. Remove ALL whitespace (spaces, tabs, newlines)
     cleaned = cleaned.replace(/\s/g, '');
-
-    // 3. Re-wrap in standard PEM format (64 chars per line)
     const lines = cleaned.match(/.{1,64}/g) || [];
     return `-----BEGIN CERTIFICATE-----\n${lines.join('\n')}\n-----END CERTIFICATE-----`;
 }
@@ -80,7 +108,6 @@ function parseKeybox(xmlData) {
   
   const extractCerts = (node) => {
     if (typeof node === 'string') {
-        // Match both PEM and raw Base64 strings
         if (node.includes('-----BEGIN CERTIFICATE-----') || (node.length > 200 && /^[A-Za-z0-9+/=\s]+$/.test(node))) {
             certs.push(node);
         }
@@ -106,6 +133,9 @@ function formatDate(date) {
     }
 }
 
+// ==========================================
+// 5. MAIN ANALYSIS FUNCTION
+// ==========================================
 async function analyzeKeybox(xmlContent) {
   let rawCerts;
   try {
@@ -118,23 +148,28 @@ async function analyzeKeybox(xmlContent) {
     return "❌ Invalid Keybox: No certificate chains found.";
   }
 
+  // Fetch both data sources
   const crlData = await fetchGoogleCRL();
+  const banList = await fetchPrivateBanList();
+  
   if (!crlData || !crlData.entries) {
     return "❌ Error: Unable to fetch Google's Revocation List. Please try again later.";
   }
 
   let isRevoked = false;
+  let isPrivatelyBanned = false;
   let hasExpiredCert = false;
   let earliestExpiryDate = null;
   let certReports = [];
   let parsedCerts = [];
+  let hasValidRoot = false;
 
-  // Step 1: Parse all certificates first
+  // Step 1: Parse all certificates
   rawCerts.forEach((rawCert, index) => {
     try {
       const pemString = formatCertificate(rawCert);
       const cert = new X509Certificate(pemString);
-      parsedCerts.push({ index, cert });
+      parsedCerts.push({ index, cert, isRoot: index === rawCerts.length - 1 });
     } catch (e) {
       console.error(`Error parsing certificate at index ${index}:`, e.message);
       certReports.push(`🔐 Certificate ${index}: ❌ Could not parse (Invalid format)\n`);
@@ -143,7 +178,7 @@ async function analyzeKeybox(xmlContent) {
   });
 
   // Step 2: Analyze each certificate
-  parsedCerts.forEach(({ index, cert }) => {
+  parsedCerts.forEach(({ index, cert, isRoot }) => {
     const notBefore = cert.notBefore || new Date(0);
     const notAfter = cert.notAfter || new Date(0);
     const now = new Date();
@@ -162,7 +197,7 @@ async function analyzeKeybox(xmlContent) {
     const basicSerial = cert.serialNumber.toString(16).toLowerCase().replace(/^0x/, '');
     const cleanSerial = basicSerial.replace(/^0+/, '');
     
-    // Properly convert ArrayBuffer to Hex String for Subject Serial
+    // Extract Subject Serial Number (SKI)
     let subjectSerial = 'Not Found';
     try {
         const skiExt = cert.extensions.find(e => e.type === '2.5.29.14');
@@ -171,6 +206,7 @@ async function analyzeKeybox(xmlContent) {
         }
     } catch (e) { /* Ignore */ }
 
+    // Check Google's CRL
     let revoked = false;
     let revokeReason = '';
     if (crlData.entries[basicSerial] || crlData.entries[cleanSerial]) {
@@ -182,6 +218,30 @@ async function analyzeKeybox(xmlContent) {
       }
     }
 
+    // Check Private Ban List (Subject Serial)
+    let privatelyBanned = false;
+    if (banList && subjectSerial !== 'Not Found') {
+        // The private ban list uses the Subject Serial (SKI) without the leading '04'
+        const cleanSubjectSerial = subjectSerial.replace(/^04/, '');
+        if (banList.has(subjectSerial) || banList.has(cleanSubjectSerial)) {
+            privatelyBanned = true;
+            isPrivatelyBanned = true;
+        }
+    }
+
+    // Check Root Certificate
+    let isGoogleRoot = false;
+    if (isRoot) {
+        const subjectName = cert.subjectName ? cert.subjectName.toString() : '';
+        for (const validRoot of VALID_GOOGLE_ROOTS) {
+            if (subjectName.includes(validRoot)) {
+                isGoogleRoot = true;
+                hasValidRoot = true;
+                break;
+            }
+        }
+    }
+
     let certMsg = `🔐 Certificate ${index} Serial: ${basicSerial}\n`;
     certMsg += `ℹ️ Subject Serial: ${subjectSerial}\n`;
     certMsg += `📅 Valid from: ${formatDate(notBefore)} to: ${formatDate(notAfter)}\n`;
@@ -190,12 +250,23 @@ async function analyzeKeybox(xmlContent) {
     else if (isNotYetValid) certMsg += `❌ Certificate not yet valid\n`;
     else certMsg += `✅ Certificate within validity period\n`;
 
-    if (revoked) certMsg += `❌ REVOKED in Google's list (Reason: ${revokeReason})\n`;
-    else certMsg += `✅ Serial number not found in Google's revoked keybox list\n`;
+    if (revoked) {
+      certMsg += `❌ REVOKED in Google's list (Reason: ${revokeReason})\n`;
+    } else if (privatelyBanned) {
+      certMsg += `❌ This subject serial number is banned (private list).\n`;
+    } else {
+      certMsg += `✅ Serial number not found in Google's revoked keybox list\n`;
+    }
+
+    if (isRoot) {
+        if (isGoogleRoot) certMsg += `✅ Google hardware attestation root certificate\n`;
+        else certMsg += `❌ Unknown root certificate\n`;
+    }
 
     certReports.push(certMsg);
   });
 
+  // Step 3: Build the final report
   let resultMsg = `📁 Keybox Analysis Report\n\n`;
   resultMsg += `• Total Certs Found: ${rawCerts.length}\n\n`;
   resultMsg += `--- Certificate Details ---\n\n`;
@@ -205,9 +276,16 @@ async function analyzeKeybox(xmlContent) {
 
   if (isRevoked) {
     resultMsg += `• Google Revocation Status: 🔴 REVOKED\n`;
-    resultMsg += `⚠️ This keybox has been banned by Google.\n`;
   } else {
     resultMsg += `• Google Revocation Status: 🟢 NOT REVOKED\n`;
+  }
+
+  if (isPrivatelyBanned) {
+    resultMsg += `• Private Ban List: 🔴 BANNED\n`;
+  }
+
+  if (!hasValidRoot && parsedCerts.length > 0) {
+    resultMsg += `• Root Certificate: ❌ UNKNOWN / INVALID\n`;
   }
 
   if (hasExpiredCert) {
@@ -215,18 +293,27 @@ async function analyzeKeybox(xmlContent) {
     if (earliestExpiryDate) {
       resultMsg += `⌛ Keybox expired on: ${formatDate(earliestExpiryDate)}\n`;
     }
-    resultMsg += `🔴 THIS KEYBOX CANNOT BE USED FOR STRONG INTEGRITY.\n`;
   } else {
     resultMsg += `\n• Keybox Expiry Status: ✅ VALID\n`;
     resultMsg += `⌛ Keybox expires on: ${formatDate(earliestExpiryDate)}\n`;
+  }
+
+  // Final verdict
+  resultMsg += `\n`;
+  if (isRevoked || isPrivatelyBanned || hasExpiredCert || !hasValidRoot) {
+    resultMsg += `🔴 THIS KEYBOX CANNOT BE USED FOR STRONG INTEGRITY.\n`;
+  } else {
     resultMsg += `🛡️ This keybox is clean and can be used for Strong Integrity (assuming local TEE setup is correct).\n`;
   }
 
-  resultMsg += `\n\nNote: Sometimes Google bans a keybox without revoking it. This bot fetches the Google revocation list, but can't know if a keybox is banned via unofficial methods.`;
+  resultMsg += `\n\nNote: Sometimes Google bans a keybox without revoking it. This bot checks both Google's official CRL and a community-maintained private ban list.`;
 
   return resultMsg;
 }
 
+// ==========================================
+// 6. BOT HANDLERS
+// ==========================================
 bot.onText(/\/start/, (msg) => {
   bot.sendMessage(msg.chat.id, "Welcome! Upload your keybox.xml file or paste its contents here to check its Google Attestation status.");
 });
@@ -235,7 +322,6 @@ bot.on('document', async (msg) => {
   const chatId = msg.chat.id;
   const fileId = msg.document.file_id;
 
-  // Helper function to fetch the file with a retry
   async function fetchFileWithRetry(retries = 3) {
     for (let i = 0; i < retries; i++) {
       try {
@@ -244,8 +330,7 @@ bot.on('document', async (msg) => {
         return response.data;
       } catch (err) {
         console.log(`Attempt ${i + 1} failed: ${err.message}`);
-        if (i === retries - 1) throw err; // Throw if all retries failed
-        // Wait 2 seconds before retrying
+        if (i === retries - 1) throw err;
         await new Promise(resolve => setTimeout(resolve, 2000)); 
       }
     }
