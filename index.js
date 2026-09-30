@@ -134,62 +134,44 @@ function formatDate(date) {
     }
 }
 
-// ============================================
-// DEBUG VERSION: Aggressive serial variant generation with logging
-// ============================================
-function getSerialVariants(cert, index) {
+// Generate all possible serial number variants for CRL matching
+// This handles the case where Google's CRL uses decimal but the cert library returns hex, and vice versa
+function getSerialVariants(cert) {
     const variants = new Set();
     try {
-        // Get the raw serial representation
-        let rawSerial = cert.serialNumber.toString();
-        console.log(`[DEBUG][Cert ${index}] raw cert.serialNumber.toString() = "${rawSerial}"`);
+        // Get raw serial (as returned by the library)
+        let rawSerial = cert.serialNumber.toString().toLowerCase().replace(/^0x/, '');
         
-        // Also try .toString(16) for comparison
-        let hexSerial = cert.serialNumber.toString(16);
-        console.log(`[DEBUG][Cert ${index}] cert.serialNumber.toString(16) = "${hexSerial}"`);
-        
-        // Strip any 0x prefix and lowercase
-        rawSerial = rawSerial.toLowerCase().replace(/^0x/, '');
-        hexSerial = hexSerial.toLowerCase().replace(/^0x/, '');
-        
-        // Always add the raw serial as-is
+        // Always add raw
         variants.add(rawSerial);
         
-        // If it looks decimal, convert to hex
+        // If raw looks decimal, convert to hex
         if (/^\d+$/.test(rawSerial)) {
             try {
                 const hex = BigInt(rawSerial).toString(16);
                 variants.add(hex);
                 variants.add(hex.replace(/^0+/, ''));
-            } catch (e) {
-                console.log(`[DEBUG][Cert ${index}] BigInt decimal->hex failed: ${e.message}`);
-            }
+            } catch (e) { /* Ignore */ }
         } 
-        // If it looks hex, convert to decimal
+        // If raw looks hex, convert to decimal
         else if (/^[0-9a-f]+$/.test(rawSerial)) {
             try {
                 const decimal = BigInt('0x' + rawSerial).toString();
                 variants.add(decimal);
-            } catch (e) {
-                console.log(`[DEBUG][Cert ${index}] BigInt hex->decimal failed: ${e.message}`);
-            }
+            } catch (e) { /* Ignore */ }
         }
         
-        // Also add the .toString(16) version variants
-        if (/^\d+$/.test(hexSerial)) {
-            variants.add(hexSerial);
-        } else if (/^[0-9a-f]+$/.test(hexSerial)) {
+        // Also try the .toString(16) variant in case it differs
+        let hexSerial = cert.serialNumber.toString(16).toLowerCase().replace(/^0x/, '');
+        if (hexSerial && hexSerial !== rawSerial) {
             variants.add(hexSerial);
             variants.add(hexSerial.replace(/^0+/, ''));
         }
         
     } catch (e) {
-        console.error(`[DEBUG][Cert ${index}] Error generating serial variants:`, e.message);
+        console.error("Error generating serial variants:", e.message);
     }
-    
-    const variantArray = Array.from(variants);
-    console.log(`[DEBUG][Cert ${index}] Final serial variants:`, variantArray);
-    return variantArray;
+    return Array.from(variants);
 }
 
 // ==========================================
@@ -214,10 +196,6 @@ async function analyzeKeybox(xmlContent) {
   if (!crlData || !crlData.entries) {
     return "❌ Error: Unable to fetch Google's Revocation List. Please try again later.";
   }
-  
-  // DEBUG: Show first 5 CRL keys so we can compare format
-  const crlSampleKeys = Object.keys(crlData.entries).slice(0, 5);
-  console.log(`[DEBUG] CRL sample keys:`, crlSampleKeys);
 
   let isRevoked = false;
   let isPrivatelyBanned = false;
@@ -258,8 +236,8 @@ async function analyzeKeybox(xmlContent) {
       }
     }
 
-    // Get all serial variants for CRL matching (WITH DEBUG)
-    const serialVariants = getSerialVariants(cert, index);
+    // Get all serial variants for CRL matching
+    const serialVariants = getSerialVariants(cert);
     const primarySerial = serialVariants[0];
     
     // Extract Subject Serial Number (SKI)
@@ -271,29 +249,20 @@ async function analyzeKeybox(xmlContent) {
         }
     } catch (e) { /* Ignore */ }
 
-    // ============================================
-    // Check CRL against ALL serial variants (WITH DEBUG)
-    // ============================================
+    // Check CRL against ALL serial variants
     let revoked = false;
     let revokeReason = '';
-    let matchedSerial = '';
     
     for (const variant of serialVariants) {
         if (crlData.entries[variant]) {
             const entry = crlData.entries[variant];
-            console.log(`[DEBUG][Cert ${index}] MATCH FOUND! Variant "${variant}" -> Status: ${entry.status}, Reason: ${entry.reason}`);
             if (entry.status === 'REVOKED') {
                 revoked = true;
                 revokeReason = entry.reason || 'Unknown';
-                matchedSerial = variant;
                 isRevoked = true;
                 break;
             }
         }
-    }
-    
-    if (!revoked) {
-        console.log(`[DEBUG][Cert ${index}] No match found in CRL for any variant.`);
     }
 
     // Check Private Ban List (Subject Serial)
@@ -303,7 +272,6 @@ async function analyzeKeybox(xmlContent) {
         if (banList.has(subjectSerial) || banList.has(cleanSubjectSerial)) {
             privatelyBanned = true;
             isPrivatelyBanned = true;
-            console.log(`[DEBUG][Cert ${index}] Subject serial matched private ban list.`);
         }
     }
 
