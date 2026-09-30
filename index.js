@@ -226,6 +226,7 @@ async function analyzeKeybox(xmlContent) {
     const serialVariants = getSerialVariants(cert);
     const primarySerial = serialVariants[0];
     
+    // Extract Subject Serial Number (SKI)
     let subjectSerial = 'Not Found';
     try {
         const skiExt = cert.extensions.find(e => e.type === '2.5.29.14');
@@ -234,6 +235,9 @@ async function analyzeKeybox(xmlContent) {
         }
     } catch (e) { /* Ignore */ }
 
+    // ============================================
+    // Check Google's official CRL
+    // ============================================
     let revoked = false;
     let revokeReason = '';
     
@@ -249,15 +253,41 @@ async function analyzeKeybox(xmlContent) {
         }
     }
 
+    // ============================================
+    // ENHANCED: Check private ban list against:
+    // 1. Subject Serial (hex & clean hex)
+    // 2. Basic Serial in all variants (hex, clean hex, decimal)
+    // ============================================
     let privatelyBanned = false;
-    if (banList && subjectSerial !== 'Not Found') {
-        const cleanSubjectSerial = subjectSerial.replace(/^04/, '');
-        if (banList.has(subjectSerial) || banList.has(cleanSubjectSerial)) {
-            privatelyBanned = true;
-            isPrivatelyBanned = true;
+    let privateBanMatch = '';
+    if (banList) {
+        // Build all possible serials to check
+        const allSerialsToCheck = new Set();
+        
+        // Add Subject Serial variants (with and without leading 04)
+        if (subjectSerial !== 'Not Found') {
+            allSerialsToCheck.add(subjectSerial);
+            allSerialsToCheck.add(subjectSerial.replace(/^04/, ''));
+        }
+        
+        // Add all Basic Serial variants
+        for (const variant of serialVariants) {
+            allSerialsToCheck.add(variant);
+        }
+        
+        // Check each variant against the ban list
+        for (const serial of allSerialsToCheck) {
+            if (banList.has(serial)) {
+                privatelyBanned = true;
+                isPrivatelyBanned = true;
+                privateBanMatch = serial;
+                console.log(`[Private Ban Match] Cert ${index} matched: ${serial}`);
+                break;
+            }
         }
     }
 
+    // Check Root/Intermediate
     let rootStatus = '';
     if (isRoot) {
         const subjectName = cert.subjectName ? cert.subjectName.toString() : '';
@@ -297,7 +327,7 @@ async function analyzeKeybox(xmlContent) {
       certMsg += `❌ Serial number found in Google's revoked keybox list\n`;
       certMsg += `🔍 Reason: ${revokeReason}\n`;
     } else if (privatelyBanned) {
-      certMsg += `❌ This subject serial number is banned (private list).\n`;
+      certMsg += `❌ This serial number is banned (private list).\n`;
     } else {
       certMsg += `✅ Serial number not found in Google's revoked keybox list\n`;
     }
@@ -307,6 +337,7 @@ async function analyzeKeybox(xmlContent) {
     certReports.push(certMsg);
   });
 
+  // Step 3: Build final report
   let resultMsg = `📁 Keybox Analysis Report\n\n`;
   resultMsg += `• Total Certs Found: ${rawCerts.length}\n\n`;
   resultMsg += `--- Certificate Details ---\n\n`;
@@ -362,7 +393,6 @@ async function analyzeKeybox(xmlContent) {
 // 6. HELPER: Process and reply (edit instead of new message)
 // ==========================================
 async function processKeybox(chatId, xmlContent, statusMessageId = null) {
-    // If we don't have an existing status message, send one
     let messageId = statusMessageId;
     if (!messageId) {
         const statusMsg = await bot.sendMessage(chatId, "🔍 Analyzing Keybox against Google's Revocation List...");
@@ -372,7 +402,6 @@ async function processKeybox(chatId, xmlContent, statusMessageId = null) {
     try {
         const report = await analyzeKeybox(xmlContent);
         
-        // Edit the status message with the final report
         try {
             await bot.editMessageText(report, {
                 chat_id: chatId,
