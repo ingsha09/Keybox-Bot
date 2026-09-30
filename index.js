@@ -165,6 +165,68 @@ function getSerialVariants(cert) {
 }
 
 // ==========================================
+// CORRECTED: Extract Subject Serial Number (SKI) properly
+// ==========================================
+function getSubjectSerials(cert) {
+    const candidates = new Set();
+    
+    // Method 1: Extract 'serialNumber' attribute from Subject DN
+    // This is what most Android keyboxes use and what ban lists reference.
+    try {
+        const subject = cert.subjectName;
+        if (subject) {
+            // Try common DN attribute names for serial
+            const attributeNames = ['serialNumber', '2.5.4.5', 'SERIALNUMBER'];
+            for (const attrName of attributeNames) {
+                try {
+                    const fields = subject.getField(attrName);
+                    if (fields && fields.length > 0) {
+                        for (const field of fields) {
+                            let val = field.value.toString().trim().toLowerCase();
+                            if (val) {
+                                candidates.add(val);
+                                // Also strip leading zeros and '04' prefix
+                                candidates.add(val.replace(/^0+/, ''));
+                                candidates.add(val.replace(/^04/, ''));
+                            }
+                        }
+                    }
+                } catch (e) { /* Try next attribute name */ }
+            }
+        }
+    } catch (e) { /* Ignore */ }
+    
+    // Method 2: Extract Subject Key Identifier (SKI) extension (2.5.29.14)
+    // Strip the DER wrapper (04 + length) to get the raw hash.
+    try {
+        const skiExt = cert.extensions.find(e => e.type === '2.5.29.14');
+        if (skiExt) {
+            let rawHex = Buffer.from(skiExt.value).toString('hex').toLowerCase();
+            
+            // DER wrapper for OCTET STRING is: 04 <length>
+            // For a 20-byte SKI, the wrapper is 04 14.
+            if (rawHex.startsWith('0414')) {
+                rawHex = rawHex.substring(4);
+            } else if (rawHex.startsWith('04')) {
+                // Generic case: read the length byte
+                const lenByte = parseInt(rawHex.substring(2, 4), 16);
+                if (!isNaN(lenByte) && lenByte > 0) {
+                    rawHex = rawHex.substring(4, 4 + lenByte * 2);
+                }
+            }
+            
+            if (rawHex) {
+                candidates.add(rawHex);
+                candidates.add(rawHex.replace(/^0+/, ''));
+                candidates.add(rawHex.replace(/^04/, ''));
+            }
+        }
+    } catch (e) { /* Ignore */ }
+    
+    return Array.from(candidates);
+}
+
+// ==========================================
 // 5. MAIN ANALYSIS FUNCTION
 // ==========================================
 async function analyzeKeybox(xmlContent) {
@@ -226,18 +288,11 @@ async function analyzeKeybox(xmlContent) {
     const serialVariants = getSerialVariants(cert);
     const primarySerial = serialVariants[0];
     
-    // Extract Subject Serial Number (SKI)
-    let subjectSerial = 'Not Found';
-    try {
-        const skiExt = cert.extensions.find(e => e.type === '2.5.29.14');
-        if (skiExt) {
-            subjectSerial = Buffer.from(skiExt.value).toString('hex').toLowerCase();
-        }
-    } catch (e) { /* Ignore */ }
+    // Get all Subject Serial candidates (DN attribute + SKI extension)
+    const subjectSerials = getSubjectSerials(cert);
+    const primarySubjectSerial = subjectSerials.length > 0 ? subjectSerials[0] : 'Not Found';
 
-    // ============================================
     // Check Google's official CRL
-    // ============================================
     let revoked = false;
     let revokeReason = '';
     
@@ -253,36 +308,24 @@ async function analyzeKeybox(xmlContent) {
         }
     }
 
-    // ============================================
-    // ENHANCED: Check private ban list against:
-    // 1. Subject Serial (hex & clean hex)
-    // 2. Basic Serial in all variants (hex, clean hex, decimal)
-    // ============================================
+    // Check private ban list against ALL serial variants
     let privatelyBanned = false;
-    let privateBanMatch = '';
     if (banList) {
-        // Build all possible serials to check
-        const allSerialsToCheck = new Set();
-        
-        // Add Subject Serial variants (with and without leading 04)
-        if (subjectSerial !== 'Not Found') {
-            allSerialsToCheck.add(subjectSerial);
-            allSerialsToCheck.add(subjectSerial.replace(/^04/, ''));
-        }
-        
-        // Add all Basic Serial variants
+        // Check both Basic Serial variants AND Subject Serial variants
         for (const variant of serialVariants) {
-            allSerialsToCheck.add(variant);
-        }
-        
-        // Check each variant against the ban list
-        for (const serial of allSerialsToCheck) {
-            if (banList.has(serial)) {
+            if (banList.has(variant)) {
                 privatelyBanned = true;
                 isPrivatelyBanned = true;
-                privateBanMatch = serial;
-                console.log(`[Private Ban Match] Cert ${index} matched: ${serial}`);
                 break;
+            }
+        }
+        if (!privatelyBanned) {
+            for (const subjSerial of subjectSerials) {
+                if (banList.has(subjSerial)) {
+                    privatelyBanned = true;
+                    isPrivatelyBanned = true;
+                    break;
+                }
             }
         }
     }
@@ -316,7 +359,7 @@ async function analyzeKeybox(xmlContent) {
     }
 
     let certMsg = `🔐 Certificate ${index} Serial: ${primarySerial}\n`;
-    certMsg += `ℹ️ Subject Serial: ${subjectSerial}\n`;
+    certMsg += `ℹ️ Subject Serial: ${primarySubjectSerial}\n`;
     certMsg += `📅 Valid from: ${formatDate(notBefore)} to: ${formatDate(notAfter)}\n`;
     
     if (isExpired) certMsg += `❌ Expired certificate\n`;
@@ -327,7 +370,7 @@ async function analyzeKeybox(xmlContent) {
       certMsg += `❌ Serial number found in Google's revoked keybox list\n`;
       certMsg += `🔍 Reason: ${revokeReason}\n`;
     } else if (privatelyBanned) {
-      certMsg += `❌ This serial number is banned (private list).\n`;
+      certMsg += `❌ This subject serial number is banned (private list).\n`;
     } else {
       certMsg += `✅ Serial number not found in Google's revoked keybox list\n`;
     }
@@ -337,7 +380,6 @@ async function analyzeKeybox(xmlContent) {
     certReports.push(certMsg);
   });
 
-  // Step 3: Build final report
   let resultMsg = `📁 Keybox Analysis Report\n\n`;
   resultMsg += `• Total Certs Found: ${rawCerts.length}\n\n`;
   resultMsg += `--- Certificate Details ---\n\n`;
