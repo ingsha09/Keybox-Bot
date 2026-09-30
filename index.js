@@ -97,6 +97,11 @@ function formatCertificate(rawString) {
     return `-----BEGIN CERTIFICATE-----\n${lines.join('\n')}\n-----END CERTIFICATE-----`;
 }
 
+// ==========================================
+// CHAIN-AWARE PARSER
+// Returns an array of chains:
+//   [ { algorithm: 'ecdsa', certs: [pem1, pem2, ...] }, ... ]
+// ==========================================
 function parseKeybox(xmlData) {
   const parser = new XMLParser({ 
     ignoreAttributes: false, 
@@ -105,24 +110,91 @@ function parseKeybox(xmlData) {
   });
   const jsonObj = parser.parse(xmlData);
   
-  const certs = [];
+  const chains = [];
   
-  const extractCerts = (node) => {
-    if (typeof node === 'string') {
-        if (node.includes('-----BEGIN CERTIFICATE-----') || (node.length > 200 && /^[A-Za-z0-9+/=\s]+$/.test(node))) {
-            certs.push(node);
-        }
-    } else if (Array.isArray(node)) {
-      node.forEach(item => extractCerts(item));
+  // Helper: recursively find all <Key> blocks
+  const findKeys = (node, results) => {
+    if (Array.isArray(node)) {
+      node.forEach(item => findKeys(item, results));
     } else if (typeof node === 'object' && node !== null) {
+      // If this node has a 'CertificateChain' property, treat it as a Key
+      if (node.CertificateChain !== undefined) {
+        results.push(node);
+      }
       for (const key in node) {
-        extractCerts(node[key]);
+        findKeys(node[key], results);
       }
     }
   };
-
-  extractCerts(jsonObj);
-  return certs;
+  
+  const keyBlocks = [];
+  findKeys(jsonObj, keyBlocks);
+  
+  // For each Key block, extract certs from its CertificateChain
+  keyBlocks.forEach((keyBlock) => {
+    const certs = [];
+    const algorithm = keyBlock['@_algorithm'] || 'unknown';
+    
+    const chain = keyBlock.CertificateChain;
+    
+    // CertificateChain.Certificate can be a single object or an array
+    const extractFromChain = (node) => {
+      if (!node) return;
+      
+      if (Array.isArray(node)) {
+        node.forEach(item => extractFromChain(item));
+        return;
+      }
+      
+      if (typeof node === 'object') {
+        // If this looks like a cert wrapper, get its text content
+        if (node['#text'] && typeof node['#text'] === 'string') {
+          const text = node['#text'];
+          if (text.includes('-----BEGIN CERTIFICATE-----') || 
+              (text.length > 200 && /^[A-Za-z0-9+/=\s]+$/.test(text))) {
+            certs.push(text);
+            return;
+          }
+        }
+        
+        // Otherwise recurse
+        for (const key in node) {
+          extractFromChain(node[key]);
+        }
+      }
+    };
+    
+    extractFromChain(chain);
+    
+    if (certs.length > 0) {
+      chains.push({ algorithm, certs });
+    }
+  });
+  
+  // Fallback: if the parser didn't find the Key structure cleanly,
+  // fall back to extracting all certs as a single chain.
+  if (chains.length === 0) {
+    const allCerts = [];
+    const extractAll = (node) => {
+      if (typeof node === 'string') {
+        if (node.includes('-----BEGIN CERTIFICATE-----') || (node.length > 200 && /^[A-Za-z0-9+/=\s]+$/.test(node))) {
+          allCerts.push(node);
+        }
+      } else if (Array.isArray(node)) {
+        node.forEach(item => extractAll(item));
+      } else if (typeof node === 'object' && node !== null) {
+        for (const key in node) {
+          extractAll(node[key]);
+        }
+      }
+    };
+    extractAll(jsonObj);
+    if (allCerts.length > 0) {
+      chains.push({ algorithm: 'unknown', certs: allCerts });
+    }
+  }
+  
+  return chains;
 }
 
 function formatDate(date) {
@@ -234,14 +306,14 @@ function getSubjectSerials(cert) {
 // 5. MAIN ANALYSIS FUNCTION
 // ==========================================
 async function analyzeKeybox(xmlContent, fileName = null) {
-  let rawCerts;
+  let chains;
   try {
-    rawCerts = parseKeybox(xmlContent);
+    chains = parseKeybox(xmlContent);
   } catch (e) {
     return "❌ Invalid Keybox XML File: Could not parse certificates.";
   }
 
-  if (rawCerts.length === 0) {
+  if (chains.length === 0) {
     return "❌ Invalid Keybox: No certificate chains found.";
   }
 
@@ -256,205 +328,214 @@ async function analyzeKeybox(xmlContent, fileName = null) {
   let isPrivatelyBanned = false;
   let hasExpiredCert = false;
   let earliestExpiryDate = null;
-  let certReports = [];
-  let parsedCerts = [];
   let hasValidRoot = false;
   let hasKnownIntermediate = false;
   let rootClassification = 'unknown';
 
-  // Step 1: Parse all certificates
-  rawCerts.forEach((rawCert, index) => {
-    try {
-      const pemString = formatCertificate(rawCert);
-      const cert = new X509Certificate(pemString);
-      parsedCerts.push({ index, cert, isRoot: index === rawCerts.length - 1 });
-    } catch (e) {
-      console.error(`Error parsing certificate at index ${index}:`, e.message);
-      certReports.push(`🔐 Certificate ${index}: ❌ Could not parse (Invalid format)\n`);
-      hasExpiredCert = true;
-    }
-  });
-
-  const totalCertsInChain = parsedCerts.length;
-
-  // ============================================
-  // Step 2: Pre-scan chain for structural integrity
-  // Only revocation and expiration break the chain.
-  // Private bans do NOT break the chain — they only affect Strong.
-  // ============================================
-  const chainStatus = {
-      hasRevoked: false,
-      hasExpired: false
-  };
-
-  parsedCerts.forEach(({ cert }) => {
-      const notAfter = cert.notAfter;
-      if (!notAfter || new Date() > notAfter) {
-          chainStatus.hasExpired = true;
-      }
-      
-      const serialVariants = getSerialVariants(cert);
-      for (const variant of serialVariants) {
-          if (crlData.entries[variant] && crlData.entries[variant].status === 'REVOKED') {
-              chainStatus.hasRevoked = true;
-              break;
-          }
-      }
-  });
-
-  // Step 3: Analyze each certificate
-  parsedCerts.forEach(({ index, cert, isRoot }) => {
-    const notBefore = cert.notBefore || new Date(0);
-    const notAfter = cert.notAfter || new Date(0);
-    const now = new Date();
-    
-    const isExpired = !cert.notAfter || now > notAfter;
-    const isNotYetValid = !cert.notBefore || now < notBefore;
-    
-    if (isExpired) hasExpiredCert = true;
-
-    if (notAfter && notAfter.getTime() > 0) {
-      if (!earliestExpiryDate || notAfter < earliestExpiryDate) {
-        earliestExpiryDate = notAfter;
-      }
-    }
-
-    const serialVariants = getSerialVariants(cert);
-    const primarySerial = serialVariants[0];
-    
-    const subjectSerials = getSubjectSerials(cert);
-    const primarySubjectSerial = subjectSerials.length > 0 ? subjectSerials[0] : 'Not Found';
-
-    let revoked = false;
-    let revokeReason = '';
-    
-    for (const variant of serialVariants) {
-        if (crlData.entries[variant]) {
-            const entry = crlData.entries[variant];
-            if (entry.status === 'REVOKED') {
-                revoked = true;
-                revokeReason = entry.reason || 'Unknown';
-                isRevoked = true;
-                break;
-            }
-        }
-    }
-
-    let privatelyBanned = false;
-    if (banList) {
-        for (const variant of serialVariants) {
-            if (banList.has(variant)) {
-                privatelyBanned = true;
-                isPrivatelyBanned = true;
-                break;
-            }
-        }
-        if (!privatelyBanned) {
-            for (const subjSerial of subjectSerials) {
-                if (banList.has(subjSerial)) {
-                    privatelyBanned = true;
-                    isPrivatelyBanned = true;
-                    break;
-                }
-            }
-        }
-    }
-
-    // Root Certificate Analysis
-    let rootStatus = '';
-    if (isRoot) {
-        const subjectName = cert.subjectName ? cert.subjectName.toString() : '';
-        const issuerName = cert.issuerName ? cert.issuerName.toString() : '';
-        const subjectTrimmed = subjectName.trim();
-        
-        let isKnownRoot = false;
-        for (const validRoot of VALID_GOOGLE_ROOTS) {
-            if (subjectName.includes(validRoot)) {
-                isKnownRoot = true;
-                break;
-            }
-        }
-        
-        const isTeeRoot = /^SERIALNUMBER=[0-9a-f]+$/i.test(subjectTrimmed) || 
-                         /^2\.5\.4\.5=[0-9a-f]+$/i.test(subjectTrimmed);
-        const isTeeIntermediate = /\bT=TEE\b/i.test(subjectName);
-        const isSelfSigned = subjectTrimmed === issuerName.trim();
-        
-        if (chainStatus.hasRevoked) {
-            rootClassification = 'chain-broken';
-            rootStatus = `❌ Unknown root certificate due to revocation of a certificate\n`;
-        } else if (chainStatus.hasExpired) {
-            rootClassification = 'chain-broken';
-            rootStatus = `❌ Unknown root certificate due to expiration of a certificate\n`;
-        } else if (isKnownRoot) {
-            rootClassification = 'valid-google-root';
-            hasValidRoot = true;
-            rootStatus = `✅ Google hardware attestation root certificate\n`;
-        } else if (isTeeRoot && isSelfSigned && totalCertsInChain > 1) {
-            rootClassification = 'valid-google-root';
-            hasValidRoot = true;
-            rootStatus = `✅ Google hardware attestation root certificate\n`;
-        } else if (isTeeRoot && isSelfSigned && totalCertsInChain === 1) {
-            rootClassification = 'custom-root';
-            rootStatus = `ℹ️ Custom/self-signed root certificate\n`;
-        } else if (isTeeIntermediate) {
-            rootClassification = 'custom-root';
-            hasKnownIntermediate = true;
-            rootStatus = `ℹ️ Known Google Intermediate (not hardware root)\n`;
-        } else {
-            let foundGoogle = false;
-            for (const intermediate of KNOWN_GOOGLE_INTERMEDIATES) {
-                if (subjectName.includes(intermediate)) {
-                    rootClassification = 'custom-root';
-                    hasKnownIntermediate = true;
-                    rootStatus = `ℹ️ Known Google Intermediate (not hardware root)\n`;
-                    foundGoogle = true;
-                    break;
-                }
-            }
-            
-            if (!foundGoogle) {
-                rootClassification = 'custom-root';
-                rootStatus = `ℹ️ Custom/self-signed root certificate\n`;
-            }
-        }
-    }
-
-    let certMsg = `🔐 Certificate ${index} Serial: ${primarySerial}\n`;
-    certMsg += `ℹ️ Subject Serial: ${primarySubjectSerial}\n`;
-    certMsg += `📅 Valid from: ${formatDate(notBefore)} to: ${formatDate(notAfter)}\n`;
-    
-    if (isExpired) certMsg += `❌ Expired certificate\n`;
-    else if (isNotYetValid) certMsg += `❌ Certificate not yet valid\n`;
-    else certMsg += `✅ Certificate within validity period\n`;
-
-    if (revoked) {
-      certMsg += `❌ Serial number found in Google's revoked keybox list\n`;
-      certMsg += `🔍 Reason: ${revokeReason}\n`;
-    } else if (privatelyBanned) {
-      certMsg += `❌ This subject serial number is banned (private list).\n`;
-    } else {
-      certMsg += `✅ Serial number not found in Google's revoked keybox list\n`;
-    }
-
-    if (rootStatus) certMsg += rootStatus;
-
-    certReports.push(certMsg);
-  });
-
-  // ==========================================
-  // Step 4: Build the report
-  // ==========================================
   let resultMsg = `📁 Keybox Analysis Report\n`;
   if (fileName) {
     resultMsg += `📄 File: ${fileName}\n`;
   }
   resultMsg += `\n`;
-  resultMsg += `• Total Certs Found: ${rawCerts.length}\n\n`;
-  resultMsg += `--- Certificate Details ---\n\n`;
-  resultMsg += certReports.join('\n');
+  
+  const totalCerts = chains.reduce((sum, c) => sum + c.certs.length, 0);
+  resultMsg += `• Total Chains Found: ${chains.length}\n`;
+  resultMsg += `• Total Certs Found: ${totalCerts}\n`;
+  chains.forEach((chain, idx) => {
+      resultMsg += `  • Chain ${idx + 1} (${chain.algorithm.toUpperCase()}): ${chain.certs.length} certs\n`;
+  });
+  resultMsg += `\n`;
 
-  resultMsg += `\n--- Summary ---\n`;
+  // ==========================================
+  // Analyze each chain
+  // ==========================================
+  for (let chainIdx = 0; chainIdx < chains.length; chainIdx++) {
+    const chain = chains[chainIdx];
+    const chainCerts = chain.certs;
+    
+    // Parse certs in this chain
+    const parsedCerts = [];
+    chainCerts.forEach((rawCert, index) => {
+      try {
+        const pemString = formatCertificate(rawCert);
+        const cert = new X509Certificate(pemString);
+        parsedCerts.push({ index, cert, isRoot: index === chainCerts.length - 1 });
+      } catch (e) {
+        console.error(`Error parsing cert ${index} in chain ${chainIdx}:`, e.message);
+      }
+    });
+    
+    if (parsedCerts.length === 0) continue;
+    
+    const totalCertsInChain = parsedCerts.length;
+    
+    // Pre-scan chain status (revocation + expiry only)
+    const chainStatus = {
+        hasRevoked: false,
+        hasExpired: false
+    };
+    
+    parsedCerts.forEach(({ cert }) => {
+        const notAfter = cert.notAfter;
+        if (!notAfter || new Date() > notAfter) {
+            chainStatus.hasExpired = true;
+        }
+        
+        const serialVariants = getSerialVariants(cert);
+        for (const variant of serialVariants) {
+            if (crlData.entries[variant] && crlData.entries[variant].status === 'REVOKED') {
+                chainStatus.hasRevoked = true;
+                break;
+            }
+        }
+    });
+    
+    resultMsg += `--- Chain ${chainIdx + 1} (${chain.algorithm.toUpperCase()}) ---\n\n`;
+    
+    parsedCerts.forEach(({ index, cert, isRoot }) => {
+      const notBefore = cert.notBefore || new Date(0);
+      const notAfter = cert.notAfter || new Date(0);
+      const now = new Date();
+      
+      const isExpired = !cert.notAfter || now > notAfter;
+      const isNotYetValid = !cert.notBefore || now < notBefore;
+      
+      if (isExpired) hasExpiredCert = true;
+
+      if (notAfter && notAfter.getTime() > 0) {
+        if (!earliestExpiryDate || notAfter < earliestExpiryDate) {
+          earliestExpiryDate = notAfter;
+        }
+      }
+
+      const serialVariants = getSerialVariants(cert);
+      const primarySerial = serialVariants[0];
+      
+      const subjectSerials = getSubjectSerials(cert);
+      const primarySubjectSerial = subjectSerials.length > 0 ? subjectSerials[0] : 'Not Found';
+
+      let revoked = false;
+      let revokeReason = '';
+      
+      for (const variant of serialVariants) {
+          if (crlData.entries[variant]) {
+              const entry = crlData.entries[variant];
+              if (entry.status === 'REVOKED') {
+                  revoked = true;
+                  revokeReason = entry.reason || 'Unknown';
+                  isRevoked = true;
+                  break;
+              }
+          }
+      }
+
+      let privatelyBanned = false;
+      if (banList) {
+          for (const variant of serialVariants) {
+              if (banList.has(variant)) {
+                  privatelyBanned = true;
+                  isPrivatelyBanned = true;
+                  break;
+              }
+          }
+          if (!privatelyBanned) {
+              for (const subjSerial of subjectSerials) {
+                  if (banList.has(subjSerial)) {
+                      privatelyBanned = true;
+                      isPrivatelyBanned = true;
+                      break;
+                  }
+              }
+          }
+      }
+
+      // Root cert classification
+      let rootStatus = '';
+      if (isRoot) {
+          const subjectName = cert.subjectName ? cert.subjectName.toString() : '';
+          const issuerName = cert.issuerName ? cert.issuerName.toString() : '';
+          const subjectTrimmed = subjectName.trim();
+          
+          let isKnownRoot = false;
+          for (const validRoot of VALID_GOOGLE_ROOTS) {
+              if (subjectName.includes(validRoot)) {
+                  isKnownRoot = true;
+                  break;
+              }
+          }
+          
+          const isTeeRoot = /^SERIALNUMBER=[0-9a-f]+$/i.test(subjectTrimmed) || 
+                           /^2\.5\.4\.5=[0-9a-f]+$/i.test(subjectTrimmed);
+          const isTeeIntermediate = /\bT=TEE\b/i.test(subjectName);
+          const isSelfSigned = subjectTrimmed === issuerName.trim();
+          
+          if (chainStatus.hasRevoked) {
+              rootClassification = 'chain-broken';
+              rootStatus = `❌ Unknown root certificate due to revocation of a certificate\n`;
+          } else if (chainStatus.hasExpired) {
+              rootClassification = 'chain-broken';
+              rootStatus = `❌ Unknown root certificate due to expiration of a certificate\n`;
+          } else if (isKnownRoot) {
+              rootClassification = 'valid-google-root';
+              hasValidRoot = true;
+              rootStatus = `✅ Google hardware attestation root certificate\n`;
+          } else if (isTeeRoot && isSelfSigned && totalCertsInChain > 1) {
+              rootClassification = 'valid-google-root';
+              hasValidRoot = true;
+              rootStatus = `✅ Google hardware attestation root certificate\n`;
+          } else if (isTeeRoot && isSelfSigned && totalCertsInChain === 1) {
+              rootClassification = 'custom-root';
+              rootStatus = `ℹ️ Custom/self-signed root certificate\n`;
+          } else if (isTeeIntermediate) {
+              rootClassification = 'custom-root';
+              hasKnownIntermediate = true;
+              rootStatus = `ℹ️ Known Google Intermediate (not hardware root)\n`;
+          } else {
+              let foundGoogle = false;
+              for (const intermediate of KNOWN_GOOGLE_INTERMEDIATES) {
+                  if (subjectName.includes(intermediate)) {
+                      rootClassification = 'custom-root';
+                      hasKnownIntermediate = true;
+                      rootStatus = `ℹ️ Known Google Intermediate (not hardware root)\n`;
+                      foundGoogle = true;
+                      break;
+                  }
+              }
+              
+              if (!foundGoogle) {
+                  rootClassification = 'custom-root';
+                  rootStatus = `ℹ️ Custom/self-signed root certificate\n`;
+              }
+          }
+      }
+
+      let certMsg = `🔐 Certificate ${index} Serial: ${primarySerial}\n`;
+      certMsg += `ℹ️ Subject Serial: ${primarySubjectSerial}\n`;
+      certMsg += `📅 Valid from: ${formatDate(notBefore)} to: ${formatDate(notAfter)}\n`;
+      
+      if (isExpired) certMsg += `❌ Expired certificate\n`;
+      else if (isNotYetValid) certMsg += `❌ Certificate not yet valid\n`;
+      else certMsg += `✅ Certificate within validity period\n`;
+
+      if (revoked) {
+        certMsg += `❌ Serial number found in Google's revoked keybox list\n`;
+        certMsg += `🔍 Reason: ${revokeReason}\n`;
+      } else if (privatelyBanned) {
+        certMsg += `❌ This subject serial number is banned (private list).\n`;
+      } else {
+        certMsg += `✅ Serial number not found in Google's revoked keybox list\n`;
+      }
+
+      if (rootStatus) certMsg += rootStatus;
+
+      resultMsg += certMsg + `\n`;
+    });
+  }
+
+  // ==========================================
+  // Summary
+  // ==========================================
+  resultMsg += `--- Summary ---\n`;
 
   const isDefinitelyBad = isRevoked || isPrivatelyBanned || hasExpiredCert;
 
@@ -482,16 +563,8 @@ async function analyzeKeybox(xmlContent, fileName = null) {
     resultMsg += `⌛ Keybox expires on: ${formatDate(earliestExpiryDate)}\n`;
   }
 
-  // ==========================================
   // Integrity Predictions
-  // Based on real-world behavior:
-  // - Revoked or Expired → all checks fail
-  // - Privately Banned → Basic + Device pass, Strong fails
-  // - Clean + Valid Google root → all pass
-  // - Clean + unknown root → Basic + Device pass, Strong fails
-  // ==========================================
   const cryptographicallyValid = !isRevoked && !hasExpiredCert;
-  
   const basicPasses  = cryptographicallyValid;
   const devicePasses = cryptographicallyValid;
   const strongPasses = cryptographicallyValid && !isPrivatelyBanned && (hasValidRoot || hasKnownIntermediate);
@@ -595,7 +668,7 @@ bot.onText(/\/help/, (msg) => {
 A keybox is an XML file containing cryptographic certificates used to pass Google Play Integrity's checks on Android devices.
 
 *How do I check one?*
-Upload a \`keybox.xml\` file or paste the raw XML content. I'll analyze every certificate in the chain.
+Upload a \`keybox.xml\` file or paste the raw XML content. I'll analyze every certificate in every chain.
 
 *What do you check?*
 ✅ *Google CRL* – Official list of revoked keyboxes
@@ -608,7 +681,6 @@ Upload a \`keybox.xml\` file or paste the raw XML content. I'll analyze every ce
 🔴 *CANNOT BE USED* – Revoked, banned, or expired
 
 *Integrity Predictions:*
-The bot predicts which integrity levels you might pass:
 • *Basic/Device* – Pass unless the keybox is revoked or expired
 • *Strong* – Requires a valid, unrevoked, unbanned, unexpired keybox with a Google root
 
