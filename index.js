@@ -45,7 +45,6 @@ bot.deleteWebHook().then(() => {
 const GOOGLE_CRL_URL = 'https://android.googleapis.com/attestation/status';
 const PRIVATE_BAN_LIST_URL = 'https://raw.githubusercontent.com/daboynb/autojson/refs/heads/main/banned.txt';
 
-// Known valid Google Hardware Attestation Root names
 const VALID_GOOGLE_ROOTS = [
     'Google Hardware Attestation Root',
     'Key Attestation CA1',
@@ -53,7 +52,6 @@ const VALID_GOOGLE_ROOTS = [
     'Droid CA2'
 ];
 
-// Known Google intermediates that are still valid but not hardware roots
 const KNOWN_GOOGLE_INTERMEDIATES = [
     'Google LLC',
     'Google'
@@ -139,6 +137,23 @@ function formatDate(date) {
     }
 }
 
+// CRITICAL FIX: Convert serial number to hex, handling both decimal and hex inputs
+function normalizeSerial(serialNumber) {
+    let serialStr = serialNumber.toString().toLowerCase().replace(/^0x/, '');
+    
+    // If it's a decimal string (only digits), convert to hex
+    if (/^\d+$/.test(serialStr)) {
+        // Handle large numbers using BigInt to avoid overflow
+        try {
+            serialStr = BigInt(serialStr).toString(16);
+        } catch (e) {
+            // If BigInt fails, it's probably already hex
+        }
+    }
+    
+    return serialStr.replace(/^0+/, '');
+}
+
 // ==========================================
 // 5. MAIN ANALYSIS FUNCTION
 // ==========================================
@@ -170,7 +185,6 @@ async function analyzeKeybox(xmlContent) {
   let hasValidRoot = false;
   let hasKnownIntermediate = false;
 
-  // Step 1: Parse all certificates
   rawCerts.forEach((rawCert, index) => {
     try {
       const pemString = formatCertificate(rawCert);
@@ -183,7 +197,6 @@ async function analyzeKeybox(xmlContent) {
     }
   });
 
-  // Step 2: Analyze each certificate
   parsedCerts.forEach(({ index, cert, isRoot }) => {
     const notBefore = cert.notBefore || new Date(0);
     const notAfter = cert.notAfter || new Date(0);
@@ -200,8 +213,8 @@ async function analyzeKeybox(xmlContent) {
       }
     }
 
-    const basicSerial = cert.serialNumber.toString(16).toLowerCase().replace(/^0x/, '');
-    const cleanSerial = basicSerial.replace(/^0+/, '');
+    const rawSerial = cert.serialNumber.toString('hex').toLowerCase().replace(/^0x/, '');
+    const basicSerial = normalizeSerial(cert.serialNumber);
     
     let subjectSerial = 'Not Found';
     try {
@@ -214,8 +227,8 @@ async function analyzeKeybox(xmlContent) {
     // Check Google's CRL
     let revoked = false;
     let revokeReason = '';
-    if (crlData.entries[basicSerial] || crlData.entries[cleanSerial]) {
-      const entry = crlData.entries[basicSerial] || crlData.entries[cleanSerial];
+    if (crlData.entries[basicSerial] || crlData.entries[rawSerial]) {
+      const entry = crlData.entries[basicSerial] || crlData.entries[rawSerial];
       if (entry.status === 'REVOKED') {
         revoked = true;
         revokeReason = entry.reason || 'Unknown';
@@ -233,32 +246,29 @@ async function analyzeKeybox(xmlContent) {
         }
     }
 
-    // Check Root/Intermediate Certificate
+    // Check Root/Intermediate
     let rootStatus = '';
     if (isRoot) {
         const subjectName = cert.subjectName ? cert.subjectName.toString() : '';
         
-        // Check if it's a known Google Hardware Root
         for (const validRoot of VALID_GOOGLE_ROOTS) {
             if (subjectName.includes(validRoot)) {
                 hasValidRoot = true;
-                rootStatus = `✅ Google Hardware Attestation Root\n`;
+                rootStatus = `✅ Google hardware attestation root certificate\n`;
                 break;
             }
         }
         
-        // If not a hardware root, check if it's a known Google intermediate
         if (!hasValidRoot) {
             for (const intermediate of KNOWN_GOOGLE_INTERMEDIATES) {
                 if (subjectName.includes(intermediate)) {
                     hasKnownIntermediate = true;
-                    rootStatus = `⚠️ Known Google Intermediate (not a hardware root)\n`;
+                    rootStatus = `⚠️ Known Google Intermediate (not hardware root)\n`;
                     break;
                 }
             }
         }
         
-        // If neither, it's unknown
         if (!hasValidRoot && !hasKnownIntermediate) {
             rootStatus = `❌ Unknown root certificate\n`;
         }
@@ -273,7 +283,8 @@ async function analyzeKeybox(xmlContent) {
     else certMsg += `✅ Certificate within validity period\n`;
 
     if (revoked) {
-      certMsg += `❌ REVOKED in Google's list (Reason: ${revokeReason})\n`;
+      certMsg += `❌ Serial number found in Google's revoked keybox list\n`;
+      certMsg += `🔍 Reason: ${revokeReason}\n`;
     } else if (privatelyBanned) {
       certMsg += `❌ This subject serial number is banned (private list).\n`;
     } else {
@@ -285,7 +296,6 @@ async function analyzeKeybox(xmlContent) {
     certReports.push(certMsg);
   });
 
-  // Step 3: Build the final report
   let resultMsg = `📁 Keybox Analysis Report\n\n`;
   resultMsg += `• Total Certs Found: ${rawCerts.length}\n\n`;
   resultMsg += `--- Certificate Details ---\n\n`;
@@ -306,7 +316,7 @@ async function analyzeKeybox(xmlContent) {
   if (hasValidRoot) {
     resultMsg += `• Root Certificate: ✅ VALID GOOGLE ROOT\n`;
   } else if (hasKnownIntermediate) {
-    resultMsg += `• Root Certificate: ⚠️ KNOWN INTERMEDIATE (not hardware root)\n`;
+    resultMsg += `• Root Certificate: ⚠️ KNOWN INTERMEDIATE\n`;
   } else {
     resultMsg += `• Root Certificate: ❌ UNKNOWN / INVALID\n`;
   }
@@ -321,14 +331,14 @@ async function analyzeKeybox(xmlContent) {
     resultMsg += `⌛ Keybox expires on: ${formatDate(earliestExpiryDate)}\n`;
   }
 
-  // Final verdict - only fail if revoked, privately banned, or expired
+  // Final verdict
   resultMsg += `\n`;
   if (isRevoked || isPrivatelyBanned || hasExpiredCert) {
     resultMsg += `🔴 THIS KEYBOX CANNOT BE USED FOR STRONG INTEGRITY.\n`;
   } else if (hasValidRoot) {
-    resultMsg += `🛡️ This keybox is clean and can be used for Strong Integrity (assuming local TEE setup is correct).\n`;
+    resultMsg += `🛡️ This keybox is clean and can be used for Strong Integrity.\n`;
   } else if (hasKnownIntermediate) {
-    resultMsg += `⚠️ This keybox uses a known Google intermediate. It MIGHT work for Strong Integrity, but is not hardware-backed.\n`;
+    resultMsg += `⚠️ This keybox uses a known Google intermediate. It MIGHT work for Strong Integrity.\n`;
   } else {
     resultMsg += `⚠️ This keybox has an unknown root. It MIGHT work for Strong Integrity, but is not guaranteed.\n`;
   }
