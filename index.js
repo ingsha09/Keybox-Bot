@@ -346,14 +346,14 @@ async function analyzeKeybox(xmlContent) {
             for (const intermediate of KNOWN_GOOGLE_INTERMEDIATES) {
                 if (subjectName.includes(intermediate)) {
                     hasKnownIntermediate = true;
-                    rootStatus = `⚠️ Known Google Intermediate (not hardware root)\n`;
+                    rootStatus = `ℹ️ Known Google Intermediate (not hardware root)\n`;
                     break;
                 }
             }
         }
         
         if (!hasValidRoot && !hasKnownIntermediate) {
-            rootStatus = `❌ Unknown root certificate\n`;
+            rootStatus = `ℹ️ Custom/self-signed root certificate\n`;
         }
     }
 
@@ -379,6 +379,7 @@ async function analyzeKeybox(xmlContent) {
     certReports.push(certMsg);
   });
 
+  // Build the report
   let resultMsg = `📁 Keybox Analysis Report\n\n`;
   resultMsg += `• Total Certs Found: ${rawCerts.length}\n\n`;
   resultMsg += `--- Certificate Details ---\n\n`;
@@ -394,14 +395,16 @@ async function analyzeKeybox(xmlContent) {
 
   if (isPrivatelyBanned) {
     resultMsg += `• Private Ban List: 🔴 BANNED\n`;
+  } else {
+    resultMsg += `• Private Ban List: 🟢 NOT BANNED\n`;
   }
 
   if (hasValidRoot) {
     resultMsg += `• Root Certificate: ✅ VALID GOOGLE ROOT\n`;
   } else if (hasKnownIntermediate) {
-    resultMsg += `• Root Certificate: ⚠️ KNOWN INTERMEDIATE\n`;
+    resultMsg += `• Root Certificate: ℹ️ KNOWN GOOGLE INTERMEDIATE\n`;
   } else {
-    resultMsg += `• Root Certificate: ❌ UNKNOWN / INVALID\n`;
+    resultMsg += `• Root Certificate: ℹ️ CUSTOM / SELF-SIGNED\n`;
   }
 
   if (hasExpiredCert) {
@@ -414,18 +417,22 @@ async function analyzeKeybox(xmlContent) {
     resultMsg += `⌛ Keybox expires on: ${formatDate(earliestExpiryDate)}\n`;
   }
 
+  // ==========================================
+  // FINAL VERDICT — Binary: 🟢 or 🔴
+  // Root type is informational only and does NOT affect the verdict.
+  // ==========================================
   resultMsg += `\n`;
-  if (isRevoked || isPrivatelyBanned || hasExpiredCert) {
+  
+  const isDefinitelyBad = isRevoked || isPrivatelyBanned || hasExpiredCert;
+  
+  if (isDefinitelyBad) {
     resultMsg += `🔴 THIS KEYBOX CANNOT BE USED FOR STRONG INTEGRITY.\n`;
-  } else if (hasValidRoot) {
-    resultMsg += `🛡️ This keybox is clean and can be used for Strong Integrity.\n`;
-  } else if (hasKnownIntermediate) {
-    resultMsg += `⚠️ This keybox uses a known Google intermediate. It MIGHT work for Strong Integrity.\n`;
   } else {
-    resultMsg += `⚠️ This keybox has an unknown root. It MIGHT work for Strong Integrity, but is not guaranteed.\n`;
+    resultMsg += `🟢 This keybox CAN be used for Strong Integrity.\n`;
   }
 
-  resultMsg += `\n\nNote: Sometimes Google bans a keybox without revoking it. This bot checks both Google's official CRL and a community-maintained private ban list.`;
+  resultMsg += `\n⚠️ Note: Sometimes Google bans a keybox without revoking it, so no bot can detect that ban. This bot checks both Google's official CRL and a community-maintained private ban list.\n\n`;
+  resultMsg += `Source: https://raw.githubusercontent.com/daboynb/autojson/refs/heads/main/banned.txt`;
 
   return resultMsg;
 }
@@ -468,8 +475,6 @@ async function processKeybox(chatId, xmlContent, statusMessageId = null) {
 // ==========================================
 // 7. COMMAND HANDLERS
 // ==========================================
-
-// /start — Welcome message with inline keyboard
 bot.onText(/\/start/, (msg) => {
     const chatId = msg.chat.id;
     const text = 
@@ -479,7 +484,6 @@ I analyze Android keybox XML files and check them against:
 • Google's Certificate Revocation List (CRL)
 • A community-maintained private ban list
 • Certificate expiration dates
-• Root certificate validation
 
 📄 *How to use:*
 Just upload your \`keybox.xml\` file, or paste the raw XML contents directly in the chat.
@@ -498,7 +502,6 @@ Use /help for detailed information about what I check and my limitations.`;
     });
 });
 
-// /help — Full FAQ
 bot.onText(/\/help/, (msg) => {
     const chatId = msg.chat.id;
     const text = 
@@ -514,15 +517,13 @@ Upload a \`keybox.xml\` file or paste the raw XML content. I'll analyze every ce
 ✅ *Google CRL* – Official list of revoked keyboxes
 ✅ *Private Ban List* – Community-maintained list of unofficially banned keyboxes
 ✅ *Expiration Dates* – Whether any certificate in the chain has expired
-✅ *Root Certificate* – Whether the chain terminates at a known Google root
 
 *What do the results mean?*
-🔴 *CANNOT BE USED* – The keybox is revoked, banned, or expired
-🛡️ *CAN BE USED* – Clean, hardware-backed, and valid
-⚠️ *MIGHT WORK* – Valid but not hardware-backed (custom/self-signed root)
+🟢 *CAN BE USED* – Not revoked, not banned, not expired
+🔴 *CANNOT BE USED* – Revoked, banned, or expired
 
-*Why does "Unknown root" appear?*
-Most community keyboxes use custom or self-signed roots. These may still pass some integrity checks but aren't guaranteed to pass Strong Integrity.
+*Why does "Custom / Self-Signed" root appear?*
+Almost all community keyboxes use custom or self-signed roots — this is completely normal and doesn't affect whether the keybox can be used. It's shown for informational purposes only.
 
 *Limitations*
 • Google sometimes bans keyboxes *without* revoking them. No bot can detect these bans.
@@ -537,7 +538,6 @@ Most community keyboxes use custom or self-signed roots. These may still pass so
     bot.sendMessage(chatId, text, { parse_mode: 'Markdown' });
 });
 
-// /about — About the bot
 bot.onText(/\/about/, (msg) => {
     const chatId = msg.chat.id;
     const text = 
@@ -550,12 +550,6 @@ A free, community-oriented tool to help you verify the status of Android keybox 
 • Google Attestation CRL (official)
 • Community ban list (daboynb/autojson)
 
-*Built with:*
-• Node.js + Telegraf
-• @peculiar/x509
-• fast-xml-parser
-• Hosted on Render
-
 *Disclaimer:*
 This bot does not store your files or any personal data. All analysis is done in-memory and discarded immediately after the report is sent.
 
@@ -566,7 +560,6 @@ Use /help for usage instructions.`;
     bot.sendMessage(chatId, text, { parse_mode: 'Markdown' });
 });
 
-// /status — Bot and data source health check
 bot.onText(/\/status/, async (msg) => {
     const chatId = msg.chat.id;
     const statusMsg = await bot.sendMessage(chatId, "⏳ Checking system status...");
@@ -601,7 +594,6 @@ bot.onText(/\/status/, async (msg) => {
     }
 });
 
-// Handle inline keyboard button clicks
 bot.on('callback_query', async (query) => {
     const chatId = query.message.chat.id;
     const data = query.data;
