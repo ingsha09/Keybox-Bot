@@ -57,52 +57,33 @@ const KNOWN_GOOGLE_INTERMEDIATES = [
     'Google'
 ];
 
-// Cache with refresh interval
-let googleCRL = null;
-let lastCRLFetch = 0;
-const CRL_CACHE_DURATION = 30 * 60 * 1000; // 30 minutes
-
-let privateBanList = null;
-let lastBanListFetch = 0;
-const BAN_LIST_CACHE_DURATION = 30 * 60 * 1000; // 30 minutes
-
+// NO CACHE - Always fetch fresh data
 async function fetchGoogleCRL() {
-  const now = Date.now();
-  if (googleCRL && (now - lastCRLFetch) < CRL_CACHE_DURATION) {
-    return googleCRL;
-  }
   try {
-    const response = await axios.get(GOOGLE_CRL_URL);
-    googleCRL = typeof response.data === 'string' ? JSON.parse(response.data) : response.data;
-    lastCRLFetch = now;
-    console.log(`Fetched Google CRL: ${Object.keys(googleCRL.entries).length} entries.`);
-    return googleCRL;
+    const response = await axios.get(GOOGLE_CRL_URL, { timeout: 10000 });
+    const data = typeof response.data === 'string' ? JSON.parse(response.data) : response.data;
+    console.log(`Fetched Google CRL: ${Object.keys(data.entries).length} entries.`);
+    return data;
   } catch (error) {
     console.error("Failed to fetch Google CRL:", error.message);
-    return googleCRL; // Return stale cache if fetch fails
+    return null;
   }
 }
 
 async function fetchPrivateBanList() {
-  const now = Date.now();
-  if (privateBanList && (now - lastBanListFetch) < BAN_LIST_CACHE_DURATION) {
-    return privateBanList;
-  }
   try {
-    const response = await axios.get(PRIVATE_BAN_LIST_URL);
+    const response = await axios.get(PRIVATE_BAN_LIST_URL, { timeout: 10000 });
     const lines = response.data.split('\n');
-    const newSet = new Set();
+    const banSet = new Set();
     for (const line of lines) {
         const serial = line.trim().toLowerCase();
-        if (serial) newSet.add(serial);
+        if (serial) banSet.add(serial);
     }
-    privateBanList = newSet;
-    lastBanListFetch = now;
-    console.log(`Loaded ${privateBanList.size} banned serials from private list.`);
-    return privateBanList;
+    console.log(`Loaded ${banSet.size} banned serials from private list.`);
+    return banSet;
   } catch (error) {
     console.error("Failed to fetch private ban list:", error.message);
-    return privateBanList;
+    return null;
   }
 }
 
@@ -154,7 +135,7 @@ function formatDate(date) {
     }
 }
 
-// Get all possible serial number formats for CRL matching
+// Generate ALL possible serial number formats for CRL matching
 function getSerialVariants(cert) {
     const variants = [];
     try {
@@ -196,6 +177,7 @@ async function analyzeKeybox(xmlContent) {
     return "❌ Invalid Keybox: No certificate chains found.";
   }
 
+  // Fetch fresh data on EVERY check
   const crlData = await fetchGoogleCRL();
   const banList = await fetchPrivateBanList();
   
@@ -244,7 +226,7 @@ async function analyzeKeybox(xmlContent) {
 
     // Get all serial variants for CRL matching
     const serialVariants = getSerialVariants(cert);
-    const primarySerial = serialVariants[0]; // hex form for display
+    const primarySerial = serialVariants[0];
     
     // Extract Subject Serial Number (SKI)
     let subjectSerial = 'Not Found';
