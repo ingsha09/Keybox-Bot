@@ -387,43 +387,40 @@ async function analyzeKeybox(xmlContent) {
 
   resultMsg += `\n--- Summary ---\n`;
 
+  // ==========================================
+  // ADAPTIVE SUMMARY
+  // If the keybox is bad, show only what's wrong.
+  // If good, show all clear signals.
+  // ==========================================
+  const isDefinitelyBad = isRevoked || isPrivatelyBanned || hasExpiredCert;
+
   if (isRevoked) {
     resultMsg += `• Google Revocation Status: 🔴 REVOKED\n`;
-  } else {
-    resultMsg += `• Google Revocation Status: 🟢 NOT REVOKED\n`;
-  }
-
-  if (isPrivatelyBanned) {
+    resultMsg += `🔍 This keybox has been officially revoked by Google.\n`;
+  } else if (isPrivatelyBanned) {
     resultMsg += `• Private Ban List: 🔴 BANNED\n`;
-  } else {
-    resultMsg += `• Private Ban List: 🟢 NOT BANNED\n`;
-  }
-
-  if (hasValidRoot) {
-    resultMsg += `• Root Certificate: ✅ VALID GOOGLE ROOT\n`;
-  } else if (hasKnownIntermediate) {
-    resultMsg += `• Root Certificate: ℹ️ KNOWN GOOGLE INTERMEDIATE\n`;
-  } else {
-    resultMsg += `• Root Certificate: ℹ️ CUSTOM / SELF-SIGNED\n`;
-  }
-
-  if (hasExpiredCert) {
-    resultMsg += `\n• Keybox Expiry Status: ❌ EXPIRED / INVALID\n`;
+    resultMsg += `🔍 This keybox is on the community ban list.\n`;
+  } else if (hasExpiredCert) {
+    resultMsg += `• Certificate Status: ❌ EXPIRED\n`;
     if (earliestExpiryDate) {
-      resultMsg += `⌛ Keybox expired on: ${formatDate(earliestExpiryDate)}\n`;
+      resultMsg += `⌛ Expired on: ${formatDate(earliestExpiryDate)}\n`;
     }
   } else {
-    resultMsg += `\n• Keybox Expiry Status: ✅ VALID\n`;
+    // Clean keybox — show all clear signals
+    resultMsg += `• Google Revocation Status: 🟢 NOT REVOKED\n`;
+    resultMsg += `• Private Ban List: 🟢 NOT BANNED\n`;
+    if (hasValidRoot) {
+      resultMsg += `• Root Certificate: ✅ VALID GOOGLE ROOT\n`;
+    } else if (hasKnownIntermediate) {
+      resultMsg += `• Root Certificate: ℹ️ KNOWN GOOGLE INTERMEDIATE\n`;
+    } else {
+      resultMsg += `• Root Certificate: ℹ️ CUSTOM / SELF-SIGNED\n`;
+    }
     resultMsg += `⌛ Keybox expires on: ${formatDate(earliestExpiryDate)}\n`;
   }
 
-  // ==========================================
-  // FINAL VERDICT — Binary: 🟢 or 🔴
-  // Root type is informational only and does NOT affect the verdict.
-  // ==========================================
+  // Final verdict
   resultMsg += `\n`;
-  
-  const isDefinitelyBad = isRevoked || isPrivatelyBanned || hasExpiredCert;
   
   if (isDefinitelyBad) {
     resultMsg += `🔴 THIS KEYBOX CANNOT BE USED FOR STRONG INTEGRITY.\n`;
@@ -431,8 +428,7 @@ async function analyzeKeybox(xmlContent) {
     resultMsg += `🟢 This keybox CAN be used for Strong Integrity.\n`;
   }
 
-  resultMsg += `\n⚠️ Note: Sometimes Google bans a keybox without revoking it, so no bot can detect that ban. This bot checks both Google's official CRL and a community-maintained private ban list.\n\n`;
-  resultMsg += `Source: https://raw.githubusercontent.com/daboynb/autojson/refs/heads/main/banned.txt`;
+  resultMsg += `\n⚠️ Note: Sometimes Google bans a keybox without revoking it, so no bot can detect that ban. This bot checks both Google's official CRL and a community-maintained private ban list.`;
 
   return resultMsg;
 }
@@ -533,7 +529,8 @@ Almost all community keyboxes use custom or self-signed roots — this is comple
 /start – Welcome message
 /help – This help message
 /about – About this bot
-/status – Check bot and data source status`;
+/status – Check bot and data source status
+/source – Show data source URLs`;
 
     bot.sendMessage(chatId, text, { parse_mode: 'Markdown' });
 });
@@ -546,9 +543,6 @@ bot.onText(/\/about/, (msg) => {
 A free, community-oriented tool to help you verify the status of Android keybox XML files.
 
 *Version:* 1.0
-*Data Sources:*
-• Google Attestation CRL (official)
-• Community ban list (daboynb/autojson)
 
 *Disclaimer:*
 This bot does not store your files or any personal data. All analysis is done in-memory and discarded immediately after the report is sent.
@@ -592,6 +586,24 @@ bot.onText(/\/status/, async (msg) => {
             message_id: statusMsg.message_id
         });
     }
+});
+
+bot.onText(/\/source/, (msg) => {
+    bot.sendMessage(msg.chat.id, 
+`📚 *Data Sources*
+
+The bot checks two independent lists on every request:
+
+1️⃣ *Google's Official CRL*
+\`https://android.googleapis.com/attestation/status\`
+
+2️⃣ *Community Ban List*
+\`https://raw.githubusercontent.com/daboynb/autojson/refs/heads/main/banned.txt\`
+
+Both are fetched fresh — no caching — so results reflect the latest published data.
+
+Credits: @antezero for maintaining the community ban list.`,
+        { parse_mode: 'Markdown' });
 });
 
 bot.on('callback_query', async (query) => {
