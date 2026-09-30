@@ -43,14 +43,20 @@ bot.deleteWebHook().then(() => {
 // 3. DATA SOURCES
 // ==========================================
 const GOOGLE_CRL_URL = 'https://android.googleapis.com/attestation/status';
-// Private ban list maintained by the community (used by other bots)
 const PRIVATE_BAN_LIST_URL = 'https://raw.githubusercontent.com/daboynb/autojson/refs/heads/main/banned.txt';
-// Known valid Google Hardware Attestation Root Certificate Subject Names
+
+// Known valid Google Hardware Attestation Root names
 const VALID_GOOGLE_ROOTS = [
     'Google Hardware Attestation Root',
     'Key Attestation CA1',
     'Droid CA1',
     'Droid CA2'
+];
+
+// Known Google intermediates that are still valid but not hardware roots
+const KNOWN_GOOGLE_INTERMEDIATES = [
+    'Google LLC',
+    'Google'
 ];
 
 let googleCRL = null;
@@ -148,7 +154,6 @@ async function analyzeKeybox(xmlContent) {
     return "❌ Invalid Keybox: No certificate chains found.";
   }
 
-  // Fetch both data sources
   const crlData = await fetchGoogleCRL();
   const banList = await fetchPrivateBanList();
   
@@ -163,6 +168,7 @@ async function analyzeKeybox(xmlContent) {
   let certReports = [];
   let parsedCerts = [];
   let hasValidRoot = false;
+  let hasKnownIntermediate = false;
 
   // Step 1: Parse all certificates
   rawCerts.forEach((rawCert, index) => {
@@ -197,7 +203,6 @@ async function analyzeKeybox(xmlContent) {
     const basicSerial = cert.serialNumber.toString(16).toLowerCase().replace(/^0x/, '');
     const cleanSerial = basicSerial.replace(/^0+/, '');
     
-    // Extract Subject Serial Number (SKI)
     let subjectSerial = 'Not Found';
     try {
         const skiExt = cert.extensions.find(e => e.type === '2.5.29.14');
@@ -218,10 +223,9 @@ async function analyzeKeybox(xmlContent) {
       }
     }
 
-    // Check Private Ban List (Subject Serial)
+    // Check Private Ban List
     let privatelyBanned = false;
     if (banList && subjectSerial !== 'Not Found') {
-        // The private ban list uses the Subject Serial (SKI) without the leading '04'
         const cleanSubjectSerial = subjectSerial.replace(/^04/, '');
         if (banList.has(subjectSerial) || banList.has(cleanSubjectSerial)) {
             privatelyBanned = true;
@@ -229,16 +233,34 @@ async function analyzeKeybox(xmlContent) {
         }
     }
 
-    // Check Root Certificate
-    let isGoogleRoot = false;
+    // Check Root/Intermediate Certificate
+    let rootStatus = '';
     if (isRoot) {
         const subjectName = cert.subjectName ? cert.subjectName.toString() : '';
+        
+        // Check if it's a known Google Hardware Root
         for (const validRoot of VALID_GOOGLE_ROOTS) {
             if (subjectName.includes(validRoot)) {
-                isGoogleRoot = true;
                 hasValidRoot = true;
+                rootStatus = `✅ Google Hardware Attestation Root\n`;
                 break;
             }
+        }
+        
+        // If not a hardware root, check if it's a known Google intermediate
+        if (!hasValidRoot) {
+            for (const intermediate of KNOWN_GOOGLE_INTERMEDIATES) {
+                if (subjectName.includes(intermediate)) {
+                    hasKnownIntermediate = true;
+                    rootStatus = `⚠️ Known Google Intermediate (not a hardware root)\n`;
+                    break;
+                }
+            }
+        }
+        
+        // If neither, it's unknown
+        if (!hasValidRoot && !hasKnownIntermediate) {
+            rootStatus = `❌ Unknown root certificate\n`;
         }
     }
 
@@ -258,10 +280,7 @@ async function analyzeKeybox(xmlContent) {
       certMsg += `✅ Serial number not found in Google's revoked keybox list\n`;
     }
 
-    if (isRoot) {
-        if (isGoogleRoot) certMsg += `✅ Google hardware attestation root certificate\n`;
-        else certMsg += `❌ Unknown root certificate\n`;
-    }
+    if (rootStatus) certMsg += rootStatus;
 
     certReports.push(certMsg);
   });
@@ -284,7 +303,11 @@ async function analyzeKeybox(xmlContent) {
     resultMsg += `• Private Ban List: 🔴 BANNED\n`;
   }
 
-  if (!hasValidRoot && parsedCerts.length > 0) {
+  if (hasValidRoot) {
+    resultMsg += `• Root Certificate: ✅ VALID GOOGLE ROOT\n`;
+  } else if (hasKnownIntermediate) {
+    resultMsg += `• Root Certificate: ⚠️ KNOWN INTERMEDIATE (not hardware root)\n`;
+  } else {
     resultMsg += `• Root Certificate: ❌ UNKNOWN / INVALID\n`;
   }
 
@@ -298,12 +321,16 @@ async function analyzeKeybox(xmlContent) {
     resultMsg += `⌛ Keybox expires on: ${formatDate(earliestExpiryDate)}\n`;
   }
 
-  // Final verdict
+  // Final verdict - only fail if revoked, privately banned, or expired
   resultMsg += `\n`;
-  if (isRevoked || isPrivatelyBanned || hasExpiredCert || !hasValidRoot) {
+  if (isRevoked || isPrivatelyBanned || hasExpiredCert) {
     resultMsg += `🔴 THIS KEYBOX CANNOT BE USED FOR STRONG INTEGRITY.\n`;
-  } else {
+  } else if (hasValidRoot) {
     resultMsg += `🛡️ This keybox is clean and can be used for Strong Integrity (assuming local TEE setup is correct).\n`;
+  } else if (hasKnownIntermediate) {
+    resultMsg += `⚠️ This keybox uses a known Google intermediate. It MIGHT work for Strong Integrity, but is not hardware-backed.\n`;
+  } else {
+    resultMsg += `⚠️ This keybox has an unknown root. It MIGHT work for Strong Integrity, but is not guaranteed.\n`;
   }
 
   resultMsg += `\n\nNote: Sometimes Google bans a keybox without revoking it. This bot checks both Google's official CRL and a community-maintained private ban list.`;
