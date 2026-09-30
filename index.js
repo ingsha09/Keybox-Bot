@@ -164,20 +164,33 @@ function getSerialVariants(cert) {
     return Array.from(variants);
 }
 
+// ==========================================
+// CORRECTED: Extract Subject Serial from OID 2.5.4.5
+// ==========================================
 function getSubjectSerials(cert) {
     const candidates = new Set();
     
     try {
         const dnString = cert.subjectName ? cert.subjectName.toString() : '';
-        const serialMatch = dnString.match(/serialNumber\s*=\s*([0-9a-fA-F]+)/i);
-        if (serialMatch && serialMatch[1]) {
-            const val = serialMatch[1].toLowerCase();
-            candidates.add(val);
-            candidates.add(val.replace(/^0+/, ''));
-            candidates.add(val.replace(/^04/, ''));
+        
+        // Match both "serialNumber=..." and "2.5.4.5=..." (OID format)
+        const patterns = [
+            /serialNumber\s*=\s*([0-9a-fA-F]+)/i,
+            /2\.5\.4\.5\s*=\s*([0-9a-fA-F]+)/i
+        ];
+        
+        for (const pattern of patterns) {
+            const match = dnString.match(pattern);
+            if (match && match[1]) {
+                const val = match[1].toLowerCase();
+                candidates.add(val);
+                candidates.add(val.replace(/^0+/, ''));
+                candidates.add(val.replace(/^04/, ''));
+            }
         }
     } catch (e) { /* Ignore */ }
     
+    // Also try getField for both names
     try {
         const subject = cert.subjectName;
         if (subject) {
@@ -207,6 +220,7 @@ function getSubjectSerials(cert) {
         }
     } catch (e) { /* Ignore */ }
     
+    // SKI extension as last-resort fallback
     try {
         const skiExt = cert.extensions.find(e => e.type === '2.5.29.14');
         if (skiExt) {
@@ -258,23 +272,6 @@ async function analyzeKeybox(xmlContent) {
       const pemString = formatCertificate(rawCert);
       const cert = new X509Certificate(pemString);
       parsedCerts.push({ index, cert, isRoot: index === rawCerts.length - 1 });
-
-      // ==== TEMPORARY DEBUG ====
-      try {
-          console.log(`\n========== DEBUG Cert ${index} ==========`);
-          console.log('subjectName.toString():', cert.subjectName ? cert.subjectName.toString() : 'N/A');
-          const subject = cert.subjectName;
-          if (subject) {
-              console.log('subject.names (JSON):', JSON.stringify(subject.names || []));
-              console.log('subject.toJSON():', JSON.stringify(subject.toJSON ? subject.toJSON() : 'N/A'));
-          }
-          console.log('Extensions:', cert.extensions ? cert.extensions.map(e => e.type) : 'N/A');
-          console.log('======================\n');
-      } catch (e) {
-          console.log(`Debug error Cert ${index}:`, e.message);
-      }
-      // ==== END DEBUG ====
-
     } catch (e) {
       console.error(`Error parsing certificate at index ${index}:`, e.message);
       certReports.push(`🔐 Certificate ${index}: ❌ Could not parse (Invalid format)\n`);
