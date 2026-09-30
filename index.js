@@ -260,8 +260,9 @@ async function analyzeKeybox(xmlContent, fileName = null) {
   let parsedCerts = [];
   let hasValidRoot = false;
   let hasKnownIntermediate = false;
-  let rootClassification = 'unknown'; // 'valid-google-root', 'custom-root', 'chain-broken'
+  let rootClassification = 'unknown';
 
+  // Step 1: Parse all certificates
   rawCerts.forEach((rawCert, index) => {
     try {
       const pemString = formatCertificate(rawCert);
@@ -275,11 +276,35 @@ async function analyzeKeybox(xmlContent, fileName = null) {
   });
 
   const totalCertsInChain = parsedCerts.length;
-  const chainHasExpiredCert = parsedCerts.some(({ cert }) => {
-      if (!cert.notAfter) return true;
-      return new Date() > cert.notAfter;
+
+  // ============================================
+  // Step 2: Pre-scan chain for structural integrity
+  // Only structural failures (revoked / expired) break the chain.
+  // Private bans do NOT break the chain — they only affect usage.
+  // ============================================
+  const chainStatus = {
+      hasRevoked: false,
+      hasExpired: false
+  };
+
+  parsedCerts.forEach(({ cert }) => {
+      // Check expiry (structural)
+      const notAfter = cert.notAfter;
+      if (!notAfter || new Date() > notAfter) {
+          chainStatus.hasExpired = true;
+      }
+      
+      // Check Google CRL revocation (structural)
+      const serialVariants = getSerialVariants(cert);
+      for (const variant of serialVariants) {
+          if (crlData.entries[variant] && crlData.entries[variant].status === 'REVOKED') {
+              chainStatus.hasRevoked = true;
+              break;
+          }
+      }
   });
 
+  // Step 3: Analyze each certificate
   parsedCerts.forEach(({ index, cert, isRoot }) => {
     const notBefore = cert.notBefore || new Date(0);
     const notAfter = cert.notAfter || new Date(0);
@@ -338,7 +363,9 @@ async function analyzeKeybox(xmlContent, fileName = null) {
     }
 
     // ============================================
-    // Root Certificate Analysis (Full chain verification)
+    // Root Certificate Analysis
+    // Only structural issues (revoked/expired) make the root unknown.
+    // A privately banned keybox can still have a valid Google root.
     // ============================================
     let rootStatus = '';
     if (isRoot) {
@@ -346,7 +373,6 @@ async function analyzeKeybox(xmlContent, fileName = null) {
         const issuerName = cert.issuerName ? cert.issuerName.toString() : '';
         const subjectTrimmed = subjectName.trim();
         
-        // Check for known Google root names
         let isKnownRoot = false;
         for (const validRoot of VALID_GOOGLE_ROOTS) {
             if (subjectName.includes(validRoot)) {
@@ -355,17 +381,16 @@ async function analyzeKeybox(xmlContent, fileName = null) {
             }
         }
         
-        // Detect TEE patterns
         const isTeeRoot = /^SERIALNUMBER=[0-9a-f]+$/i.test(subjectTrimmed) || 
                          /^2\.5\.4\.5=[0-9a-f]+$/i.test(subjectTrimmed);
         const isTeeIntermediate = /\bT=TEE\b/i.test(subjectName);
         const isSelfSigned = subjectTrimmed === issuerName.trim();
         
-        // ==========================================
-        // CRITICAL: If ANY cert in the chain is expired,
-        // the whole trust chain is broken — regardless of DN.
-        // ==========================================
-        if (chainHasExpiredCert) {
+        // Structural failure: revocation or expiry makes the chain invalid
+        if (chainStatus.hasRevoked) {
+            rootClassification = 'chain-broken';
+            rootStatus = `❌ Unknown root certificate due to revocation of a certificate\n`;
+        } else if (chainStatus.hasExpired) {
             rootClassification = 'chain-broken';
             rootStatus = `❌ Unknown root certificate due to expiration of a certificate\n`;
         } else if (isKnownRoot) {
@@ -373,12 +398,10 @@ async function analyzeKeybox(xmlContent, fileName = null) {
             hasValidRoot = true;
             rootStatus = `✅ Google hardware attestation root certificate\n`;
         } else if (isTeeRoot && isSelfSigned && totalCertsInChain > 1) {
-            // Real TEE root: multi-cert chain + self-signed + TEE DN format
             rootClassification = 'valid-google-root';
             hasValidRoot = true;
             rootStatus = `✅ Google hardware attestation root certificate\n`;
         } else if (isTeeRoot && isSelfSigned && totalCertsInChain === 1) {
-            // Single self-signed cert claiming to be TEE root — fake
             rootClassification = 'custom-root';
             rootStatus = `ℹ️ Custom/self-signed root certificate\n`;
         } else if (isTeeIntermediate) {
@@ -386,7 +409,6 @@ async function analyzeKeybox(xmlContent, fileName = null) {
             hasKnownIntermediate = true;
             rootStatus = `ℹ️ Known Google Intermediate (not hardware root)\n`;
         } else {
-            // Fallback
             let foundGoogle = false;
             for (const intermediate of KNOWN_GOOGLE_INTERMEDIATES) {
                 if (subjectName.includes(intermediate)) {
@@ -427,9 +449,7 @@ async function analyzeKeybox(xmlContent, fileName = null) {
     certReports.push(certMsg);
   });
 
-  // ==========================================
-  // Build the report
-  // ==========================================
+  // Step 4: Build the report
   let resultMsg = `📁 Keybox Analysis Report\n`;
   if (fileName) {
     resultMsg += `📄 File: ${fileName}\n`;
@@ -527,7 +547,7 @@ I analyze Android keybox XML files and check them against:
 • Google's Certificate Revocation List (CRL)
 • A community-maintained private ban list
 • Certificate expiration dates
-• Root certificate type
+• Full chain trust validation
 
 📄 *How to use:*
 Just upload your \`keybox.xml\` file, or paste the raw XML contents directly in the chat.
@@ -561,7 +581,7 @@ Upload a \`keybox.xml\` file or paste the raw XML content. I'll analyze every ce
 ✅ *Google CRL* – Official list of revoked keyboxes
 ✅ *Private Ban List* – Community-maintained list of unofficially banned keyboxes
 ✅ *Expiration Dates* – Whether any certificate in the chain has expired
-✅ *Root Certificate* – Whether the chain terminates at a valid Google root
+✅ *Chain Trust* – Whether the full chain validates end-to-end
 
 *What do the results mean?*
 🟢 *CAN BE USED* – Not revoked, not banned, not expired
