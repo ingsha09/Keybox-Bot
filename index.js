@@ -137,13 +137,11 @@ function formatDate(date) {
     }
 }
 
-// CRITICAL FIX: Convert serial number to hex, handling both decimal and hex inputs
+// Convert a serial number to hex (handles decimal and hex inputs)
 function normalizeSerial(serialNumber) {
     let serialStr = serialNumber.toString().toLowerCase().replace(/^0x/, '');
     
-    // If it's a decimal string (only digits), convert to hex
     if (/^\d+$/.test(serialStr)) {
-        // Handle large numbers using BigInt to avoid overflow
         try {
             serialStr = BigInt(serialStr).toString(16);
         } catch (e) {
@@ -185,6 +183,7 @@ async function analyzeKeybox(xmlContent) {
   let hasValidRoot = false;
   let hasKnownIntermediate = false;
 
+  // Step 1: Parse all certificates
   rawCerts.forEach((rawCert, index) => {
     try {
       const pemString = formatCertificate(rawCert);
@@ -197,6 +196,7 @@ async function analyzeKeybox(xmlContent) {
     }
   });
 
+  // Step 2: Analyze each certificate
   parsedCerts.forEach(({ index, cert, isRoot }) => {
     const notBefore = cert.notBefore || new Date(0);
     const notAfter = cert.notAfter || new Date(0);
@@ -213,9 +213,11 @@ async function analyzeKeybox(xmlContent) {
       }
     }
 
-    const rawSerial = cert.serialNumber.toString('hex').toLowerCase().replace(/^0x/, '');
+    // Get the raw serial (as it appears in the cert) and the normalized hex
+    const rawSerial = cert.serialNumber.toString().toLowerCase().replace(/^0x/, '');
     const basicSerial = normalizeSerial(cert.serialNumber);
     
+    // Extract Subject Serial Number (SKI)
     let subjectSerial = 'Not Found';
     try {
         const skiExt = cert.extensions.find(e => e.type === '2.5.29.14');
@@ -224,19 +226,27 @@ async function analyzeKeybox(xmlContent) {
         }
     } catch (e) { /* Ignore */ }
 
-    // Check Google's CRL
+    // ============================================
+    // CRITICAL FIX: Check BOTH raw decimal AND hex serials against CRL
+    // Google sometimes lists bans under the decimal format, not hex
+    // ============================================
     let revoked = false;
     let revokeReason = '';
-    if (crlData.entries[basicSerial] || crlData.entries[rawSerial]) {
-      const entry = crlData.entries[basicSerial] || crlData.entries[rawSerial];
-      if (entry.status === 'REVOKED') {
-        revoked = true;
-        revokeReason = entry.reason || 'Unknown';
-        isRevoked = true;
-      }
+    const serialsToCheck = [rawSerial, basicSerial];
+    
+    for (const serial of serialsToCheck) {
+        if (crlData.entries[serial]) {
+            const entry = crlData.entries[serial];
+            if (entry.status === 'REVOKED') {
+                revoked = true;
+                revokeReason = entry.reason || 'Unknown';
+                isRevoked = true;
+                break;
+            }
+        }
     }
 
-    // Check Private Ban List
+    // Check Private Ban List (Subject Serial)
     let privatelyBanned = false;
     if (banList && subjectSerial !== 'Not Found') {
         const cleanSubjectSerial = subjectSerial.replace(/^04/, '');
@@ -246,7 +256,7 @@ async function analyzeKeybox(xmlContent) {
         }
     }
 
-    // Check Root/Intermediate
+    // Check Root/Intermediate Certificate
     let rootStatus = '';
     if (isRoot) {
         const subjectName = cert.subjectName ? cert.subjectName.toString() : '';
@@ -296,6 +306,7 @@ async function analyzeKeybox(xmlContent) {
     certReports.push(certMsg);
   });
 
+  // Step 3: Build the final report
   let resultMsg = `📁 Keybox Analysis Report\n\n`;
   resultMsg += `• Total Certs Found: ${rawCerts.length}\n\n`;
   resultMsg += `--- Certificate Details ---\n\n`;
