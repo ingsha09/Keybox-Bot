@@ -97,11 +97,6 @@ function formatCertificate(rawString) {
     return `-----BEGIN CERTIFICATE-----\n${lines.join('\n')}\n-----END CERTIFICATE-----`;
 }
 
-// ==========================================
-// CHAIN-AWARE PARSER
-// Returns an array of chains:
-//   [ { algorithm: 'ecdsa', certs: [pem1, pem2, ...] }, ... ]
-// ==========================================
 function parseKeybox(xmlData) {
   const parser = new XMLParser({ 
     ignoreAttributes: false, 
@@ -112,12 +107,10 @@ function parseKeybox(xmlData) {
   
   const chains = [];
   
-  // Helper: recursively find all <Key> blocks
   const findKeys = (node, results) => {
     if (Array.isArray(node)) {
       node.forEach(item => findKeys(item, results));
     } else if (typeof node === 'object' && node !== null) {
-      // If this node has a 'CertificateChain' property, treat it as a Key
       if (node.CertificateChain !== undefined) {
         results.push(node);
       }
@@ -130,14 +123,11 @@ function parseKeybox(xmlData) {
   const keyBlocks = [];
   findKeys(jsonObj, keyBlocks);
   
-  // For each Key block, extract certs from its CertificateChain
   keyBlocks.forEach((keyBlock) => {
     const certs = [];
     const algorithm = keyBlock['@_algorithm'] || 'unknown';
-    
     const chain = keyBlock.CertificateChain;
     
-    // CertificateChain.Certificate can be a single object or an array
     const extractFromChain = (node) => {
       if (!node) return;
       
@@ -147,7 +137,6 @@ function parseKeybox(xmlData) {
       }
       
       if (typeof node === 'object') {
-        // If this looks like a cert wrapper, get its text content
         if (node['#text'] && typeof node['#text'] === 'string') {
           const text = node['#text'];
           if (text.includes('-----BEGIN CERTIFICATE-----') || 
@@ -157,7 +146,6 @@ function parseKeybox(xmlData) {
           }
         }
         
-        // Otherwise recurse
         for (const key in node) {
           extractFromChain(node[key]);
         }
@@ -171,8 +159,7 @@ function parseKeybox(xmlData) {
     }
   });
   
-  // Fallback: if the parser didn't find the Key structure cleanly,
-  // fall back to extracting all certs as a single chain.
+  // Fallback: extract all certs as one chain
   if (chains.length === 0) {
     const allCerts = [];
     const extractAll = (node) => {
@@ -346,14 +333,10 @@ async function analyzeKeybox(xmlContent, fileName = null) {
   });
   resultMsg += `\n`;
 
-  // ==========================================
-  // Analyze each chain
-  // ==========================================
   for (let chainIdx = 0; chainIdx < chains.length; chainIdx++) {
     const chain = chains[chainIdx];
     const chainCerts = chain.certs;
     
-    // Parse certs in this chain
     const parsedCerts = [];
     chainCerts.forEach((rawCert, index) => {
       try {
@@ -369,7 +352,6 @@ async function analyzeKeybox(xmlContent, fileName = null) {
     
     const totalCertsInChain = parsedCerts.length;
     
-    // Pre-scan chain status (revocation + expiry only)
     const chainStatus = {
         hasRevoked: false,
         hasExpired: false
@@ -449,7 +431,6 @@ async function analyzeKeybox(xmlContent, fileName = null) {
           }
       }
 
-      // Root cert classification
       let rootStatus = '';
       if (isRoot) {
           const subjectName = cert.subjectName ? cert.subjectName.toString() : '';
@@ -532,9 +513,6 @@ async function analyzeKeybox(xmlContent, fileName = null) {
     });
   }
 
-  // ==========================================
-  // Summary
-  // ==========================================
   resultMsg += `--- Summary ---\n`;
 
   const isDefinitelyBad = isRevoked || isPrivatelyBanned || hasExpiredCert;
@@ -563,7 +541,6 @@ async function analyzeKeybox(xmlContent, fileName = null) {
     resultMsg += `⌛ Keybox expires on: ${formatDate(earliestExpiryDate)}\n`;
   }
 
-  // Integrity Predictions
   const cryptographicallyValid = !isRevoked && !hasExpiredCert;
   const basicPasses  = cryptographicallyValid;
   const devicePasses = cryptographicallyValid;
@@ -580,7 +557,6 @@ async function analyzeKeybox(xmlContent, fileName = null) {
     ? `✅ MEETS_STRONG_INTEGRITY: Expected to pass\n`
     : `❌ MEETS_STRONG_INTEGRITY: Expected to fail\n`;
 
-  // Final verdict
   resultMsg += `\n`;
   if (isDefinitelyBad) {
     resultMsg += `🔴 THIS KEYBOX CANNOT BE USED FOR STRONG INTEGRITY.\n`;
@@ -633,6 +609,19 @@ async function processKeybox(chatId, xmlContent, statusMessageId = null, fileNam
 // ==========================================
 bot.onText(/\/start/, (msg) => {
     const chatId = msg.chat.id;
+    const isGroup = msg.chat.type === 'group' || msg.chat.type === 'supergroup';
+    
+    if (isGroup) {
+        bot.sendMessage(chatId, 
+`🤖 *Keybox Checker Bot* is ready.
+
+Upload a \`keybox.xml\` file and I'll analyze it against Google's CRL and the community ban list.
+
+Use /help for details.`,
+            { parse_mode: 'Markdown' });
+        return;
+    }
+    
     const text = 
 `👋 *Welcome to Keybox Checker Bot!*
 
@@ -788,7 +777,17 @@ bot.on('callback_query', async (query) => {
 bot.on('document', async (msg) => {
   const chatId = msg.chat.id;
   const fileId = msg.document.file_id;
-  const fileName = msg.document.file_name || 'keybox.xml';
+  const fileName = msg.document.file_name || '';
+  const lowerName = fileName.toLowerCase();
+
+  // Only process files that look like keybox XML files.
+  // Silently ignore everything else (ZIPs, APKs, images, PDFs, etc.).
+  const isXmlFile = lowerName.endsWith('.xml');
+  const hasKeyboxInName = lowerName.includes('keybox');
+
+  if (!isXmlFile && !hasKeyboxInName) {
+    return; // Silent ignore
+  }
 
   async function fetchFileWithRetry(retries = 3) {
     for (let i = 0; i < retries; i++) {
@@ -819,4 +818,14 @@ bot.on('text', async (msg) => {
     const statusMsg = await bot.sendMessage(msg.chat.id, "🔍 Analyzing Keybox XML...");
     await processKeybox(msg.chat.id, msg.text, statusMsg.message_id, 'Pasted XML');
   }
+});
+
+// ==========================================
+// 9. EXPLICITLY DO NOTHING ON NEW MEMBERS
+// ==========================================
+// This is a safeguard: even if a handler for this event is
+// accidentally added in the future, this one prevents any
+// unwanted greeting messages in group chats.
+bot.on('new_chat_members', () => {
+    // Intentionally empty — do not greet new members
 });
