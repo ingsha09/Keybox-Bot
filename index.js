@@ -260,6 +260,7 @@ async function analyzeKeybox(xmlContent, fileName = null) {
   let parsedCerts = [];
   let hasValidRoot = false;
   let hasKnownIntermediate = false;
+  let rootClassification = 'unknown'; // 'valid-google-root', 'custom-root', 'chain-broken'
 
   rawCerts.forEach((rawCert, index) => {
     try {
@@ -274,6 +275,10 @@ async function analyzeKeybox(xmlContent, fileName = null) {
   });
 
   const totalCertsInChain = parsedCerts.length;
+  const chainHasExpiredCert = parsedCerts.some(({ cert }) => {
+      if (!cert.notAfter) return true;
+      return new Date() > cert.notAfter;
+  });
 
   parsedCerts.forEach(({ index, cert, isRoot }) => {
     const notBefore = cert.notBefore || new Date(0);
@@ -333,7 +338,7 @@ async function analyzeKeybox(xmlContent, fileName = null) {
     }
 
     // ============================================
-    // Root Certificate Analysis (Fixed)
+    // Root Certificate Analysis (Full chain verification)
     // ============================================
     let rootStatus = '';
     if (isRoot) {
@@ -341,55 +346,61 @@ async function analyzeKeybox(xmlContent, fileName = null) {
         const issuerName = cert.issuerName ? cert.issuerName.toString() : '';
         const subjectTrimmed = subjectName.trim();
         
-        // Check 1: Known Google root names (CN=Key Attestation CA1, etc.)
+        // Check for known Google root names
         let isKnownRoot = false;
         for (const validRoot of VALID_GOOGLE_ROOTS) {
             if (subjectName.includes(validRoot)) {
-                hasValidRoot = true;
-                rootStatus = `✅ Google hardware attestation root certificate\n`;
                 isKnownRoot = true;
                 break;
             }
         }
         
-        if (!isKnownRoot) {
-            // Detect DN patterns
-            const isTeeIntermediate = /\bT=TEE\b/i.test(subjectName);
-            const isTeeRoot = /^SERIALNUMBER=[0-9a-f]+$/i.test(subjectTrimmed) || 
-                             /^2\.5\.4\.5=[0-9a-f]+$/i.test(subjectTrimmed);
-            const isSelfSigned = subjectTrimmed === issuerName.trim();
+        // Detect TEE patterns
+        const isTeeRoot = /^SERIALNUMBER=[0-9a-f]+$/i.test(subjectTrimmed) || 
+                         /^2\.5\.4\.5=[0-9a-f]+$/i.test(subjectTrimmed);
+        const isTeeIntermediate = /\bT=TEE\b/i.test(subjectName);
+        const isSelfSigned = subjectTrimmed === issuerName.trim();
+        
+        // ==========================================
+        // CRITICAL: If ANY cert in the chain is expired,
+        // the whole trust chain is broken — regardless of DN.
+        // ==========================================
+        if (chainHasExpiredCert) {
+            rootClassification = 'chain-broken';
+            rootStatus = `❌ Unknown root certificate due to expiration of a certificate\n`;
+        } else if (isKnownRoot) {
+            rootClassification = 'valid-google-root';
+            hasValidRoot = true;
+            rootStatus = `✅ Google hardware attestation root certificate\n`;
+        } else if (isTeeRoot && isSelfSigned && totalCertsInChain > 1) {
+            // Real TEE root: multi-cert chain + self-signed + TEE DN format
+            rootClassification = 'valid-google-root';
+            hasValidRoot = true;
+            rootStatus = `✅ Google hardware attestation root certificate\n`;
+        } else if (isTeeRoot && isSelfSigned && totalCertsInChain === 1) {
+            // Single self-signed cert claiming to be TEE root — fake
+            rootClassification = 'custom-root';
+            rootStatus = `ℹ️ Custom/self-signed root certificate\n`;
+        } else if (isTeeIntermediate) {
+            rootClassification = 'custom-root';
+            hasKnownIntermediate = true;
+            rootStatus = `ℹ️ Known Google Intermediate (not hardware root)\n`;
+        } else {
+            // Fallback
+            let foundGoogle = false;
+            for (const intermediate of KNOWN_GOOGLE_INTERMEDIATES) {
+                if (subjectName.includes(intermediate)) {
+                    rootClassification = 'custom-root';
+                    hasKnownIntermediate = true;
+                    rootStatus = `ℹ️ Known Google Intermediate (not hardware root)\n`;
+                    foundGoogle = true;
+                    break;
+                }
+            }
             
-            if (isTeeRoot && isSelfSigned && totalCertsInChain > 1) {
-                // Real TEE root — part of a proper multi-cert chain,
-                // self-signed, and uses the TEE root DN format.
-                // The Key Attestation app verifies these against Google's
-                // known public key, so we trust the chain structure.
-                hasValidRoot = true;
-                rootStatus = `✅ Google hardware attestation root certificate\n`;
-            } else if (isTeeRoot && isSelfSigned && totalCertsInChain === 1) {
-                // Single self-signed cert mimicking a TEE root.
-                // This is the signature of a fake keybox — real TEE roots
-                // are never the only cert in a chain.
+            if (!foundGoogle) {
+                rootClassification = 'custom-root';
                 rootStatus = `ℹ️ Custom/self-signed root certificate\n`;
-            } else if (isTeeIntermediate) {
-                // TEE intermediate cert (has T=TEE)
-                hasKnownIntermediate = true;
-                rootStatus = `ℹ️ Known Google Intermediate (not hardware root)\n`;
-            } else {
-                // Fallback: check for Google in DN
-                let foundGoogle = false;
-                for (const intermediate of KNOWN_GOOGLE_INTERMEDIATES) {
-                    if (subjectName.includes(intermediate)) {
-                        hasKnownIntermediate = true;
-                        rootStatus = `ℹ️ Known Google Intermediate (not hardware root)\n`;
-                        foundGoogle = true;
-                        break;
-                    }
-                }
-                
-                if (!foundGoogle) {
-                    rootStatus = `ℹ️ Custom/self-signed root certificate\n`;
-                }
             }
         }
     }
@@ -446,7 +457,7 @@ async function analyzeKeybox(xmlContent, fileName = null) {
   } else {
     resultMsg += `• Google Revocation Status: 🟢 NOT REVOKED\n`;
     resultMsg += `• Private Ban List: 🟢 NOT BANNED\n`;
-    if (hasValidRoot) {
+    if (rootClassification === 'valid-google-root') {
       resultMsg += `• Root Certificate: ✅ VALID GOOGLE ROOT\n`;
     } else if (hasKnownIntermediate) {
       resultMsg += `• Root Certificate: ℹ️ KNOWN GOOGLE INTERMEDIATE\n`;
